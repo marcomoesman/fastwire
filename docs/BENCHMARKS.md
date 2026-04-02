@@ -1,22 +1,22 @@
 # FastWire Benchmarks
 
-Benchmark results from an Apple M4 MacBook Pro (10-core, darwin/arm64), Go 1.26, 6 runs per benchmark.
+Benchmark results from an Apple M4 MacBook Pro (10-core, darwin/arm64), Go 1.26, 5 runs per benchmark.
 
 ## Wire Primitives
 
-| Benchmark | ns/op | MB/s | B/op | allocs/op |
-|-----------|------:|-----:|-----:|----------:|
-| VarIntEncode | 1.70 | — | 0 | 0 |
-| VarIntDecode | 1.70 | — | 0 | 0 |
+| Benchmark | ns/op | B/op | allocs/op |
+|-----------|------:|-----:|----------:|
+| VarIntEncode | 1.72 | 0 | 0 |
+| VarIntDecode | 1.73 | 0 | 0 |
 
 VarInt encode/decode of a 2-byte value (300) runs at sub-2ns with zero allocations.
 
 ## Packet Header
 
-| Benchmark | ns/op | MB/s | B/op | allocs/op |
-|-----------|------:|-----:|-----:|----------:|
-| PacketMarshal | 2.49 | — | 0 | 0 |
-| PacketUnmarshal | 2.59 | — | 0 | 0 |
+| Benchmark | ns/op | B/op | allocs/op |
+|-----------|------:|-----:|----------:|
+| PacketMarshal | 2.26 | 0 | 0 |
+| PacketUnmarshal | 2.59 | 0 | 0 |
 
 Header marshal/unmarshal operates entirely on caller-supplied buffers — zero allocations.
 
@@ -24,10 +24,10 @@ Header marshal/unmarshal operates entirely on caller-supplied buffers — zero a
 
 | Benchmark | ns/op | MB/s | B/op | allocs/op |
 |-----------|------:|-----:|-----:|----------:|
-| EncryptAES | 93.8 | 1067 | 144 | 2 |
-| DecryptAES | 105.0 | 953 | 128 | 2 |
-| EncryptChaCha | 230.5 | 434 | 144 | 2 |
-| DecryptChaCha | 257.5 | 389 | 128 | 2 |
+| EncryptAES | 95.2 | 1051 | 144 | 2 |
+| DecryptAES | 111.8 | 896 | 128 | 2 |
+| EncryptChaCha | 235.2 | 425 | 144 | 2 |
+| DecryptChaCha | 261.0 | 383 | 128 | 2 |
 
 AES-128-GCM is ~2.5x faster than ChaCha20-Poly1305 on M4 (hardware AES-NI). Both achieve sub-microsecond per-packet latency.
 
@@ -35,38 +35,59 @@ AES-128-GCM is ~2.5x faster than ChaCha20-Poly1305 on M4 (hardware AES-NI). Both
 
 | Benchmark | ns/op | MB/s | B/op | allocs/op |
 |-----------|------:|-----:|-----:|----------:|
-| CompressLZ4 | 3957 | 255 | 1199 | 1 |
-| CompressZstd | 1968 | 512 | 1030 | 1 |
+| CompressLZ4 | 3929 | 257 | 1179 | 1 |
+| CompressZstd | 1933 | 521 | 1029 | 1 |
 
 Zstd achieves ~2x the throughput of LZ4 on this workload. Both use pooled compressor instances (1 alloc for the output buffer).
 
 ## Fragmentation (4000-byte payload, ~4 fragments)
 
+| Benchmark | ns/op | B/op | allocs/op |
+|-----------|------:|-----:|----------:|
+| FragmentSplit | 343 | 4192 | 2 |
+| FragmentReassemble | 807 | 8896 | 10 |
+
+Splitting uses a single contiguous backing allocation (2 allocs total). Reassembly uses single-pass copy with tracked byte totals.
+
+## Full Send Pipeline (500-byte compressible payload)
+
+Exercises the complete `sendMessage` pipeline: compress → marshal header → sequence tracking → encrypt → writeEncrypted, with ack recycling every 32 packets.
+
 | Benchmark | ns/op | MB/s | B/op | allocs/op |
 |-----------|------:|-----:|-----:|----------:|
-| FragmentSplit | 569 | — | 4512 | 5 |
-| FragmentReassemble | 1082 | — | 8896 | 10 |
+| SendPlain (no crypto, no compression) | 225 | 2,228 | 1335 | 3 |
+| SendAES_LZ4 (AES-128-GCM + LZ4) | 4,138 | 121 | 2,224 | 7 |
+| SendAES_Zstd (AES-128-GCM + Zstd) | 2,071 | 241 | 2,401 | 7 |
 
-Splitting is ~2x faster than reassembly. The reassembly store allocates buffers for each fragment plus the final concatenation.
+Without compression or encryption, the raw send pipeline achieves ~2.2 GB/s. LZ4 compression dominates the encrypted send path (~3,930 ns/op for compression alone). Zstd provides ~2x higher throughput than LZ4 for compressible payloads.
 
-## Full Pipeline
+## Full Receive Pipeline (500-byte compressible payload)
 
-| Benchmark | ns/op | MB/s | B/op | allocs/op | Description |
-|-----------|------:|-----:|-----:|----------:|-------------|
-| FullSendPath | 4096 | 122 | 875 | 6 | compress → fragment → encrypt → send (500B payload, AES + LZ4, with ack recycling) |
-| FullRecvPath | 189 | 2689 | 528 | 2 | decrypt → unmarshal → decompress (500B payload, AES, no compression) |
-| ServerThroughput | 2795 | — | 2040 | 15 | 10 clients Send() + server Tick() per iteration |
+Exercises the complete receive pipeline matching `processPacket`: decrypt → unmarshal → touchRecv → ACK processing → recordReceive → fragment reassembly → decompress → channel deliver → handler callback.
 
-The send path is dominated by compression and encryption. Buffer pooling eliminates per-packet send buffer and retransmit copy allocations — send buffers are recycled via `sync.Pool` when packets are acknowledged. The receive path is faster because the benchmark skips decompression (no compressed flag set). Read buffers are also pooled in the read loop but this is not reflected in the RecvPath microbenchmark.
+| Benchmark | ns/op | MB/s | B/op | allocs/op |
+|-----------|------:|-----:|-----:|----------:|
+| RecvPlain (no crypto, no compression) | 104.6 | 4,779 | 48 | 2 |
+| RecvAES_LZ4 (AES-128-GCM + LZ4) | 363.9 | 1,374 | 808 | 8 |
+| RecvAES_Zstd (AES-128-GCM + Zstd) | 649.6 | 770 | 957 | 9 |
 
-Key optimizations:
-- **Inline FNV-1a** for connection table sharding eliminates per-packet hash allocation on the server
-- **Bitfield-based ack processing** replaces map allocation in the hot ack path
-- **Atomic timestamps** remove mutex contention from send/recv touch operations
-- **Single `time.Now()` per tick** threaded through all downstream methods
-- **Pooled heartbeat/retransmit buffers** via `sync.Pool` for plaintext and encrypted output
-- **O(1) loss tracking** via index map in the LossTracker ring buffer
-- **Pooled batch datagram buffers** recycle MTU-sized buffers in `flushBatch`
+The receive path is faster than send because decompression is inherently cheaper than compression (LZ4 decompression is essentially memcpy with offsets, while compression requires hash table lookups). Decrypt output uses pooled buffers via `sync.Pool`. Compressed payloads go through fragment reassembly even for single-fragment messages (compression flags force fragmentation in the wire format).
+
+## Server Throughput
+
+| Benchmark | ns/op | B/op | allocs/op | Description |
+|-----------|------:|-----:|----------:|-------------|
+| ServerThroughput | 2,806 | 2,193 | 15 | 10 clients Send() + server Tick() per iteration |
+
+## Loss Tracker
+
+| Benchmark | ns/op | B/op | allocs/op |
+|-----------|------:|-----:|----------:|
+| LossRecordSend | 5.07 | 0 | 0 |
+| LossRecordAck | 48.1 | 0 | 0 |
+| LossLoss | 0.48 | 0 | 0 |
+
+Loss ratio reads are fully lock-free via atomics. The ring buffer scan (100 entries max) has better cache locality than a map-based approach.
 
 ## How to Reproduce
 
@@ -75,8 +96,8 @@ Key optimizations:
 go test -run='^$' -bench=. -benchmem ./...
 
 # Run with multiple iterations for stability
-go test -run='^$' -bench=. -benchmem -count=6 ./...
+go test -run='^$' -bench=. -benchmem -count=5 ./...
 
 # Run a specific benchmark
-go test -run='^$' -bench=BenchmarkEncryptAES -benchmem ./...
+go test -run='^$' -bench=BenchmarkSendAES_LZ4 -benchmem ./...
 ```

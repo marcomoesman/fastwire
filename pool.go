@@ -41,6 +41,25 @@ func putSendBuffer(buf []byte) {
 	}
 }
 
+// decryptPool provides reusable buffers for AEAD decrypt output.
+var decryptPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, DefaultMTU)
+		return buf
+	},
+}
+
+func getDecryptBuffer() []byte {
+	return decryptPool.Get().([]byte)
+}
+
+func putDecryptBuffer(buf []byte) {
+	if cap(buf) >= DefaultMTU {
+		//nolint:staticcheck // SA6002: we intentionally store []byte in sync.Pool
+		decryptPool.Put(buf[:cap(buf)])
+	}
+}
+
 // newReadPool creates a sync.Pool for read buffers of the given size.
 func newReadPool(size int) *sync.Pool {
 	return &sync.Pool{New: func() any { return make([]byte, size) }}

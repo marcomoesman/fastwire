@@ -457,13 +457,16 @@ func (c *Connection) sendSinglePacket(ch *channel, channelID byte, payload []byt
 	copy(buf[n:], payload)
 	plaintext := buf[:n+len(payload)]
 
-	encrypted, err := fwcrypto.Encrypt(c.sendCipher, plaintext, nil)
+	encBuf := getSendBuffer(fwcrypto.NonceSize + len(plaintext) + fwcrypto.TagSize)
+	encrypted, err := fwcrypto.Encrypt(c.sendCipher, plaintext, encBuf)
 	if err != nil {
+		putSendBuffer(encBuf)
 		putSendBuffer(buf)
 		return err
 	}
 
 	if err := c.writeEncrypted(encrypted); err != nil {
+		putSendBuffer(encBuf)
 		putSendBuffer(buf)
 		return err
 	}
@@ -521,13 +524,16 @@ func (c *Connection) sendFragmented(ch *channel, channelID byte, compressed []by
 		copy(buf[n:], frag)
 		plaintext := buf[:n+len(frag)]
 
-		encrypted, err := fwcrypto.Encrypt(c.sendCipher, plaintext, nil)
+		encBuf := getSendBuffer(fwcrypto.NonceSize + len(plaintext) + fwcrypto.TagSize)
+		encrypted, err := fwcrypto.Encrypt(c.sendCipher, plaintext, encBuf)
 		if err != nil {
+			putSendBuffer(encBuf)
 			putSendBuffer(buf)
 			return err
 		}
 
 		if err := c.writeEncrypted(encrypted); err != nil {
+			putSendBuffer(encBuf)
 			putSendBuffer(buf)
 			return err
 		}
@@ -557,7 +563,58 @@ func (c *Connection) sendFragmented(ch *channel, channelID byte, compressed []by
 
 // sendHeartbeat sends a heartbeat control packet on channel 0.
 func (c *Connection) sendHeartbeat() error {
-	return c.sendHeartbeatOnChannel(0)
+	return c.sendMultiChannelHeartbeat([]byte{0})
+}
+
+// sendMultiChannelHeartbeat sends a single control packet carrying the ACK
+// state for all specified channels.
+func (c *Connection) sendMultiChannelHeartbeat(channelIDs []byte) error {
+	entries := make([]multiAckEntry, 0, len(channelIDs))
+	for _, chID := range channelIDs {
+		ch := c.channel(chID)
+		if ch == nil {
+			continue
+		}
+		ack, ackField := ch.ackState()
+		entries = append(entries, multiAckEntry{Channel: chID, Ack: ack, AckField: ackField})
+	}
+	if len(entries) == 0 {
+		return nil
+	}
+
+	var ctrlBuf [256]byte
+	n, err := marshalMultiAck(ctrlBuf[:], entries)
+	if err != nil {
+		return err
+	}
+
+	hdr := &PacketHeader{
+		Flags:   FlagControl,
+		Channel: 0,
+	}
+
+	buf := getSendBuffer(64 + n)
+	pn, err := buildControlPacket(buf, hdr, ctrlBuf[:n])
+	if err != nil {
+		putSendBuffer(buf)
+		return err
+	}
+
+	encBuf := getSendBuffer(fwcrypto.NonceSize + pn + fwcrypto.TagSize)
+	encrypted, err := fwcrypto.Encrypt(c.sendCipher, buf[:pn], encBuf)
+	putSendBuffer(buf)
+	if err != nil {
+		putSendBuffer(encBuf)
+		return err
+	}
+
+	err = c.sendFramed(encrypted)
+	putSendBuffer(encrypted[:cap(encrypted)])
+	if err != nil {
+		return err
+	}
+	c.touchSend()
+	return nil
 }
 
 // sendHeartbeatOnChannel sends a heartbeat control packet carrying the ack state

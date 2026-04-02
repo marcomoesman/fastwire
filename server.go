@@ -579,7 +579,10 @@ func (s *Server) handleHandshake(addr netip.AddrPort, data []byte) {
 
 // processPacket is the receive pipeline for a single encrypted packet.
 func (s *Server) processPacket(conn *Connection, data []byte) {
-	decrypted, err := fwcrypto.Decrypt(conn.recvCipher, data, nil)
+	dstBuf := getDecryptBuffer()
+	defer putDecryptBuffer(dstBuf)
+
+	decrypted, err := fwcrypto.Decrypt(conn.recvCipher, data, dstBuf)
 	if err != nil {
 		s.handler.OnError(conn, err)
 		return
@@ -615,6 +618,26 @@ func (s *Server) processPacket(conn *Connection, data []byte) {
 		ct := ControlType(decrypted[n])
 		switch ct {
 		case ControlHeartbeat:
+			return
+		case ControlMultiAck:
+			// Multi-channel ACK: parse entries and process acks for each channel.
+			entries, _, err := unmarshalMultiAck(decrypted[n+1:])
+			if err != nil {
+				return
+			}
+			for _, entry := range entries {
+				aCh := conn.channel(entry.Channel)
+				if aCh == nil {
+					continue
+				}
+				acked := aCh.processAcks(entry.Ack, entry.AckField, conn.rttState)
+				if len(acked) > 0 {
+					conn.cc.OnAck(len(acked))
+					for _, seq := range acked {
+						conn.loss.RecordAck(seq)
+					}
+				}
+			}
 			return
 		case ControlDisconnect:
 			conn.releasePendingBuffers()
@@ -777,11 +800,15 @@ func (s *Server) tickConnection(conn *Connection, now time.Time) {
 		}
 	}
 
-	// Flush pending acks for channels that received data.
+	// Flush pending acks — coalesce all channels into a single multi-ack packet.
+	var ackChannels []byte
 	for i, ch := range conn.channels {
 		if ch.clearNeedsAck() {
-			_ = conn.sendHeartbeatOnChannel(byte(i))
+			ackChannels = append(ackChannels, byte(i))
 		}
+	}
+	if len(ackChannels) > 0 {
+		_ = conn.sendMultiChannelHeartbeat(ackChannels)
 	}
 
 	// Heartbeat.

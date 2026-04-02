@@ -91,6 +91,43 @@ func TestLossTrackerDuplicateAck(t *testing.T) {
 	}
 }
 
+func BenchmarkLossRecordSend(b *testing.B) {
+	lt := NewLossTracker()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := range b.N {
+		lt.RecordSend(uint32(i))
+	}
+}
+
+func BenchmarkLossRecordAck(b *testing.B) {
+	lt := NewLossTracker()
+	// Pre-fill the ring buffer.
+	for i := uint32(0); i < 100; i++ {
+		lt.RecordSend(i)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := range b.N {
+		lt.RecordAck(uint32(i % 100))
+	}
+}
+
+func BenchmarkLossLoss(b *testing.B) {
+	lt := NewLossTracker()
+	for i := uint32(0); i < 100; i++ {
+		lt.RecordSend(i)
+		if i%2 == 0 {
+			lt.RecordAck(i)
+		}
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		_ = lt.Loss()
+	}
+}
+
 func TestLossTrackerConcurrent(t *testing.T) {
 	lt := NewLossTracker()
 	var wg sync.WaitGroup

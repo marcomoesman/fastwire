@@ -1,6 +1,6 @@
 # Future Work
 
-All 11 implementation phases are complete. Below are potential improvements for future development.
+All 13 implementation phases are complete. Below are potential improvements for future development.
 
 ## Stateless Cookies
 

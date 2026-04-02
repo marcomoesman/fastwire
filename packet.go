@@ -33,6 +33,7 @@ const (
 	ControlHeartbeat       ControlType = 0x06
 	ControlVersionMismatch ControlType = 0x07
 	ControlReject          ControlType = 0x08
+	ControlMultiAck        ControlType = 0x09
 )
 
 // MarshalHeader encodes h into buf.

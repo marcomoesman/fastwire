@@ -616,3 +616,80 @@ func FuzzUnmarshalChallenge(f *testing.F) {
 		_, _ = unmarshalChallenge(data) // must not panic
 	})
 }
+
+// --- Multi-ACK tests ---
+
+func TestMultiAckMarshalRoundTrip(t *testing.T) {
+	tests := []struct {
+		name    string
+		entries []multiAckEntry
+	}{
+		{"single", []multiAckEntry{
+			{Channel: 0, Ack: 42, AckField: 0xFFFFFFFF},
+		}},
+		{"four_channels", []multiAckEntry{
+			{Channel: 0, Ack: 100, AckField: 0x0000FFFF},
+			{Channel: 1, Ack: 50, AckField: 0x00000001},
+			{Channel: 2, Ack: 1, AckField: 0},
+			{Channel: 3, Ack: 999999, AckField: 0xAAAAAAAA},
+		}},
+		{"large_ack_varint", []multiAckEntry{
+			{Channel: 0, Ack: 0xFFFFFFFF, AckField: 0},
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var buf [256]byte
+			n, err := marshalMultiAck(buf[:], tt.entries)
+			if err != nil {
+				t.Fatalf("marshalMultiAck: %v", err)
+			}
+			if buf[0] != byte(ControlMultiAck) {
+				t.Fatalf("control type = %d, want %d", buf[0], ControlMultiAck)
+			}
+			// Parse from after the ControlType byte.
+			got, consumed, err := unmarshalMultiAck(buf[1:n])
+			if err != nil {
+				t.Fatalf("unmarshalMultiAck: %v", err)
+			}
+			if consumed != n-1 {
+				t.Fatalf("consumed = %d, want %d", consumed, n-1)
+			}
+			if len(got) != len(tt.entries) {
+				t.Fatalf("len(entries) = %d, want %d", len(got), len(tt.entries))
+			}
+			for i, e := range got {
+				if e != tt.entries[i] {
+					t.Errorf("entry[%d] = %+v, want %+v", i, e, tt.entries[i])
+				}
+			}
+		})
+	}
+}
+
+func TestMultiAckEmptyEntries(t *testing.T) {
+	var buf [256]byte
+	n, err := marshalMultiAck(buf[:], nil)
+	if err != nil {
+		t.Fatalf("marshalMultiAck(nil): %v", err)
+	}
+	if n != 2 { // type + count=0
+		t.Fatalf("n = %d, want 2", n)
+	}
+	got, _, err := unmarshalMultiAck(buf[1:n])
+	if err != nil {
+		t.Fatalf("unmarshalMultiAck: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("len(entries) = %d, want 0", len(got))
+	}
+}
+
+func TestMultiAckBufferTooSmall(t *testing.T) {
+	entries := []multiAckEntry{{Channel: 0, Ack: 1, AckField: 0}}
+	var buf [3]byte // too small for 1 entry
+	_, err := marshalMultiAck(buf[:], entries)
+	if err == nil {
+		t.Fatal("expected error for small buffer")
+	}
+}

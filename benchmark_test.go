@@ -10,34 +10,46 @@ import (
 	fwcrypto "github.com/marcomoesman/fastwire/crypto"
 )
 
-// BenchmarkFullSendPath exercises the full send pipeline:
-// compress → fragment check → marshal header → encrypt → sendFunc.
-// It simulates realistic ack flow by acking every 32 packets, allowing
-// the buffer pool to recycle send buffers as it would in production.
-func BenchmarkFullSendPath(b *testing.B) {
+// benchSendConfig holds configuration for a send path benchmark variant.
+type benchSendConfig struct {
+	name        string
+	cipher      fwcrypto.CipherSuite
+	compression CompressionAlgorithm
+}
+
+// benchSendVariants defines the three send path benchmark configurations.
+var benchSendVariants = []benchSendConfig{
+	{"Plain", fwcrypto.CipherNone, CompressionNone},
+	{"AES_LZ4", fwcrypto.CipherAES128GCM, CompressionLZ4},
+	{"AES_Zstd", fwcrypto.CipherAES128GCM, CompressionZstd},
+}
+
+func benchmarkSendPath(b *testing.B, cfg benchSendConfig) {
 	addr := netip.MustParseAddrPort("127.0.0.1:9000")
-	key := make([]byte, 16)
-	if _, err := rand.Read(key); err != nil {
-		b.Fatal(err)
+	var key []byte
+	if cfg.cipher != fwcrypto.CipherNone {
+		key = make([]byte, 16)
+		if _, err := rand.Read(key); err != nil {
+			b.Fatal(err)
+		}
 	}
-	sendCS, err := fwcrypto.NewCipherState(key, CipherAES128GCM)
+	sendCS, err := fwcrypto.NewCipherState(key, cfg.cipher)
 	if err != nil {
 		b.Fatal(err)
 	}
-	recvCS, err := fwcrypto.NewCipherState(key, CipherAES128GCM)
+	recvCS, err := fwcrypto.NewCipherState(key, cfg.cipher)
 	if err != nil {
 		b.Fatal(err)
 	}
 
-	conn := newConnection(addr, sendCS, recvCS, CipherAES128GCM, DefaultChannelLayout(), CompressionConfig{
-		Algorithm: CompressionLZ4,
+	conn := newConnection(addr, sendCS, recvCS, cfg.cipher, DefaultChannelLayout(), CompressionConfig{
+		Algorithm: cfg.compression,
 		Hurdle:    DefaultCompressionHurdle,
 	}, CongestionConservative, 0, 0, MigrationToken{})
 
-	// No-op sendFunc.
 	conn.sendFunc = func(data []byte) error { return nil }
 
-	ch := conn.channels[0] // ReliableOrdered
+	ch := conn.channels[0]
 	payload := []byte(strings.Repeat("send path benchmark ", 25)) // ~500 bytes
 	b.SetBytes(int64(len(payload)))
 	b.ReportAllocs()
@@ -47,81 +59,184 @@ func BenchmarkFullSendPath(b *testing.B) {
 	for b.Loop() {
 		_ = conn.sendMessage(payload, 0)
 		seq++
-		// Ack every 32 packets to simulate realistic ack flow and allow
-		// pool buffer recycling (ackField 0xFFFFFFFF acks seq plus prior 32).
 		if seq%32 == 0 {
 			ch.processAcks(seq, 0xFFFFFFFF, nil)
 		}
 	}
 }
 
-// BenchmarkFullRecvPath exercises: decrypt → UnmarshalHeader → decompressPayload.
-func BenchmarkFullRecvPath(b *testing.B) {
-	key := make([]byte, 16)
-	if _, err := rand.Read(key); err != nil {
-		b.Fatal(err)
-	}
-	sendCS, err := fwcrypto.NewCipherState(key, CipherAES128GCM)
-	if err != nil {
-		b.Fatal(err)
-	}
+func BenchmarkSendPlain(b *testing.B)    { benchmarkSendPath(b, benchSendVariants[0]) }
+func BenchmarkSendAES_LZ4(b *testing.B)  { benchmarkSendPath(b, benchSendVariants[1]) }
+func BenchmarkSendAES_Zstd(b *testing.B) { benchmarkSendPath(b, benchSendVariants[2]) }
 
-	// Build a typical packet: header + payload.
-	payload := make([]byte, 500)
-	if _, err := rand.Read(payload); err != nil {
-		b.Fatal(err)
-	}
-
-	hdr := &PacketHeader{
-		Channel:  0,
-		Sequence: 1,
-		Ack:      0,
-		AckField: 0,
-	}
-	buf := make([]byte, MaxHeaderSize+len(payload))
-	n, err := MarshalHeader(buf, hdr)
-	if err != nil {
-		b.Fatal(err)
-	}
-	copy(buf[n:], payload)
-	plaintext := buf[:n+len(payload)]
-
-	// Pre-encrypt b.N packets with monotonic nonces.
-	packets := make([][]byte, b.N)
-	for i := range b.N {
-		enc, err := fwcrypto.Encrypt(sendCS, plaintext, nil)
-		if err != nil {
+// benchmarkRecvPath exercises the full receive pipeline matching processPacket:
+// decrypt → unmarshal → touchRecv → ACK processing → recordReceive → deliver →
+// decompress → handler callback.
+// A sender connection produces realistic encrypted packets via sendMessage, and
+// the receiver connection processes them through the full pipeline.
+func benchmarkRecvPath(b *testing.B, cfg benchSendConfig) {
+	addr := netip.MustParseAddrPort("127.0.0.1:9000")
+	var key []byte
+	if cfg.cipher != fwcrypto.CipherNone {
+		key = make([]byte, 16)
+		if _, err := rand.Read(key); err != nil {
 			b.Fatal(err)
 		}
-		packets[i] = enc
 	}
 
-	recvCS, err := fwcrypto.NewCipherState(key, CipherAES128GCM)
+	// Sender connection — produces encrypted packets.
+	sendCS, err := fwcrypto.NewCipherState(key, cfg.cipher)
 	if err != nil {
 		b.Fatal(err)
 	}
-
-	cp, err := newCompressorPool(CompressionConfig{Algorithm: CompressionNone})
+	sendRecvCS, err := fwcrypto.NewCipherState(key, cfg.cipher)
 	if err != nil {
 		b.Fatal(err)
 	}
+	sender := newConnection(addr, sendCS, sendRecvCS, cfg.cipher, DefaultChannelLayout(), CompressionConfig{
+		Algorithm: cfg.compression,
+		Hurdle:    DefaultCompressionHurdle,
+	}, CongestionConservative, 0, 0, MigrationToken{})
 
-	b.SetBytes(int64(len(plaintext)))
+	// Capture encrypted packets from sendFunc.
+	const maxPrealloc = 8192
+	packets := make([][]byte, 0, maxPrealloc)
+	sender.sendFunc = func(data []byte) error {
+		if len(packets) < maxPrealloc {
+			cp := make([]byte, len(data))
+			copy(cp, data)
+			packets = append(packets, cp)
+		}
+		return nil
+	}
+
+	// Generate packets by sending through the full send pipeline.
+	payload := []byte(strings.Repeat("recv path benchmark ", 25)) // ~500 bytes
+	for range maxPrealloc {
+		_ = sender.sendMessage(payload, 0)
+	}
+
+	// Receiver connection — processes encrypted packets.
+	recvSendCS, err := fwcrypto.NewCipherState(key, cfg.cipher)
+	if err != nil {
+		b.Fatal(err)
+	}
+	recvCS, err := fwcrypto.NewCipherState(key, cfg.cipher)
+	if err != nil {
+		b.Fatal(err)
+	}
+	receiver := newConnection(addr, recvSendCS, recvCS, cfg.cipher, DefaultChannelLayout(), CompressionConfig{
+		Algorithm: cfg.compression,
+		Hurdle:    DefaultCompressionHurdle,
+	}, CongestionConservative, 0, 0, MigrationToken{})
+	receiver.setState(StateConnected)
+	receiver.sendFunc = func(data []byte) error { return nil }
+
+	numPackets := len(packets)
+	if numPackets == 0 {
+		b.Fatal("no packets captured from sender")
+	}
+
+	// No-op handler for delivery callbacks.
+	var msgSink []byte
+
+	b.SetBytes(int64(len(payload)))
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := range b.N {
-		decrypted, err := fwcrypto.Decrypt(recvCS, packets[i], nil)
+		idx := i % numPackets
+		// Reset receiver state when cycling to avoid replay/duplicate rejection.
+		if idx == 0 && i > 0 {
+			recvCS, err = fwcrypto.NewCipherState(key, cfg.cipher)
+			if err != nil {
+				b.Fatal(err)
+			}
+			receiver.recvCipher = recvCS
+			receiver.reassembly = newReassemblyStore()
+			for _, ch := range receiver.channels {
+				ch.mu.Lock()
+				ch.recvAck = 0
+				ch.recvAckField = 0
+				ch.recvNextDeliver = 1
+				ch.mu.Unlock()
+			}
+		}
+
+		data := packets[idx]
+
+		// Full receive pipeline (mirrors processPacket).
+		dstBuf := getDecryptBuffer()
+		decrypted, err := fwcrypto.Decrypt(receiver.recvCipher, data, dstBuf)
 		if err != nil {
+			putDecryptBuffer(dstBuf)
 			b.Fatal(err)
 		}
-		hdr, hn, err := UnmarshalHeader(decrypted)
+
+		hdr, n, err := UnmarshalHeader(decrypted)
 		if err != nil {
+			putDecryptBuffer(dstBuf)
 			b.Fatal(err)
 		}
-		_, _ = cp.decompressPayload(decrypted[hn:], 0)
-		_ = hdr
+
+		receiver.touchRecv()
+
+		ch := receiver.channel(hdr.Channel)
+
+		// ACK processing.
+		acked := ch.processAcks(hdr.Ack, hdr.AckField, receiver.rttState)
+		if len(acked) > 0 {
+			receiver.cc.OnAck(len(acked))
+			for _, seq := range acked {
+				receiver.loss.RecordAck(seq)
+			}
+		}
+
+		// Duplicate check.
+		ch.recordReceive(hdr.Sequence)
+
+		recvPayload := decrypted[n:]
+
+		// Fragment handling + decompression (mirrors processPacket).
+		if hdr.Flags&FlagFragment != 0 {
+			fh, fn, err := UnmarshalFragmentHeader(recvPayload)
+			if err != nil {
+				putDecryptBuffer(dstBuf)
+				b.Fatal(err)
+			}
+			assembled, complete, err := receiver.reassembly.addFragment(fh, recvPayload[fn:])
+			if err != nil {
+				putDecryptBuffer(dstBuf)
+				b.Fatal(err)
+			}
+			if !complete {
+				ch.deliver(hdr.Sequence, nil)
+				putDecryptBuffer(dstBuf)
+				continue
+			}
+			decompressed, err := receiver.compress.decompressPayload(assembled, fh.FragmentFlags)
+			if err != nil {
+				putDecryptBuffer(dstBuf)
+				b.Fatal(err)
+			}
+			recvPayload = decompressed
+		}
+
+		// Deliver + handler callback.
+		msgs := ch.deliver(hdr.Sequence, recvPayload)
+		for _, msg := range msgs {
+			if msg != nil {
+				msgSink = msg
+			}
+		}
+
+		putDecryptBuffer(dstBuf)
 	}
+	_ = msgSink
 }
+
+func BenchmarkRecvPlain(b *testing.B)    { benchmarkRecvPath(b, benchSendVariants[0]) }
+func BenchmarkRecvAES_LZ4(b *testing.B)  { benchmarkRecvPath(b, benchSendVariants[1]) }
+func BenchmarkRecvAES_Zstd(b *testing.B) { benchmarkRecvPath(b, benchSendVariants[2]) }
 
 // BenchmarkServerThroughput exercises a TickDriven server with 10 connected clients.
 func BenchmarkServerThroughput(b *testing.B) {

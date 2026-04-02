@@ -16,6 +16,7 @@
 | 10 | Testing, Benchmarks & Documentation | Done |
 | 11 | Send Batching, Migration, Coalescing & Bandwidth | Done |
 | 12 | Performance Optimization | Done |
+| 13 | Performance Optimization Pass 2 | Done |
 
 ## Phase Completion Process
 
@@ -25,4 +26,4 @@ Each phase produces a `phase-*.md` file with:
 
 ## All Phases Complete
 
-All 12 phases are done. See `progress/next.md` for future work ideas.
+All 13 phases are done. See `progress/next.md` for future work ideas.

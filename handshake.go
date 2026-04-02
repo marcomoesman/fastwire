@@ -295,6 +295,66 @@ func marshalHeartbeat(buf []byte) (int, error) {
 	return heartbeatSize, nil
 }
 
+// multiAckEntry holds the ACK state for a single channel in a multi-channel ACK packet.
+type multiAckEntry struct {
+	Channel  byte
+	Ack      uint32
+	AckField uint32
+}
+
+// marshalMultiAck writes a ControlMultiAck payload:
+// ControlType (1B) + Count (1B) + entries (Channel 1B + Ack VarInt + AckField 4B LE each).
+func marshalMultiAck(buf []byte, entries []multiAckEntry) (int, error) {
+	if len(buf) < 2 {
+		return 0, ErrBufferTooSmall
+	}
+	buf[0] = byte(ControlMultiAck)
+	buf[1] = byte(len(entries))
+	offset := 2
+	for _, e := range entries {
+		// Need at least 1 (channel) + 1 (min VarInt) + 4 (ackField) = 6 bytes.
+		if offset+10 > len(buf) { // 10 = max per entry (1 + 5 + 4)
+			return 0, ErrBufferTooSmall
+		}
+		buf[offset] = e.Channel
+		offset++
+		offset += PutVarInt(buf[offset:], e.Ack)
+		binary.LittleEndian.PutUint32(buf[offset:], e.AckField)
+		offset += 4
+	}
+	return offset, nil
+}
+
+// unmarshalMultiAck parses a ControlMultiAck payload (after the ControlType byte).
+// data starts at the Count byte.
+func unmarshalMultiAck(data []byte) ([]multiAckEntry, int, error) {
+	if len(data) < 1 {
+		return nil, 0, ErrInvalidHandshake
+	}
+	count := int(data[0])
+	offset := 1
+	entries := make([]multiAckEntry, 0, count)
+	for range count {
+		if offset >= len(data) {
+			return nil, 0, ErrInvalidHandshake
+		}
+		ch := data[offset]
+		offset++
+		ack, n, err := ReadVarInt(data[offset:])
+		if err != nil {
+			return nil, 0, err
+		}
+		offset += n
+		if offset+4 > len(data) {
+			return nil, 0, ErrInvalidHandshake
+		}
+		ackField := binary.LittleEndian.Uint32(data[offset:])
+		offset += 4
+		entries = append(entries, multiAckEntry{Channel: ch, Ack: ack, AckField: ackField})
+	}
+	return entries, offset, nil
+}
+
 func marshalDisconnect(buf []byte) (int, error) {
 	if len(buf) < disconnectPaySize {
 		return 0, ErrBufferTooSmall

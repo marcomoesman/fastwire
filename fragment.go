@@ -75,7 +75,7 @@ func UnmarshalFragmentHeader(buf []byte) (FragmentHeader, int, error) {
 }
 
 // splitMessage splits payload into fragments, each prefixed with a serialized FragmentHeader.
-// Returns a slice of independently allocated buffers (FragmentHeader + chunk).
+// All fragment buffers share a single contiguous backing allocation.
 // Empty payload produces a single fragment with count=1 and zero-length chunk.
 func splitMessage(payload []byte, fragmentID uint16, flags FragmentFlag) ([][]byte, error) {
 	fragmentCount := 1
@@ -87,15 +87,27 @@ func splitMessage(payload []byte, fragmentID uint16, flags FragmentFlag) ([][]by
 	}
 
 	fragments := make([][]byte, fragmentCount)
+
+	// Compute total backing size: all full fragments + possibly shorter last fragment.
+	lastChunkLen := len(payload) - (fragmentCount-1)*MaxFragmentPayload
+	if fragmentCount == 1 {
+		lastChunkLen = len(payload)
+	}
+	totalSize := (fragmentCount-1)*(FragmentHeaderSize+MaxFragmentPayload) +
+		FragmentHeaderSize + lastChunkLen
+
+	backing := make([]byte, totalSize)
+
+	offset := 0
 	for i := range fragmentCount {
 		start := i * MaxFragmentPayload
 		end := start + MaxFragmentPayload
 		if end > len(payload) {
 			end = len(payload)
 		}
-		chunk := payload[start:end]
+		fragSize := FragmentHeaderSize + (end - start)
+		buf := backing[offset : offset+fragSize]
 
-		buf := make([]byte, FragmentHeaderSize+len(chunk))
 		h := FragmentHeader{
 			FragmentID:    fragmentID,
 			FragmentIndex: byte(i),
@@ -105,19 +117,21 @@ func splitMessage(payload []byte, fragmentID uint16, flags FragmentFlag) ([][]by
 		if _, err := MarshalFragmentHeader(buf, &h); err != nil {
 			return nil, err
 		}
-		copy(buf[FragmentHeaderSize:], chunk)
+		copy(buf[FragmentHeaderSize:], payload[start:end])
 		fragments[i] = buf
+		offset += fragSize
 	}
 	return fragments, nil
 }
 
 // reassemblyBuffer holds fragments for a single message being reassembled.
 type reassemblyBuffer struct {
-	fragments [][]byte // indexed by FragmentIndex; nil = not yet received
-	received  int
-	count     int
-	flags     FragmentFlag
-	createdAt time.Time
+	fragments  [][]byte // indexed by FragmentIndex; nil = not yet received
+	received   int
+	count      int
+	flags      FragmentFlag
+	totalBytes int // running total of received payload bytes
+	createdAt  time.Time
 }
 
 // reassemblyStore manages in-progress fragment reassembly keyed by fragment ID.
@@ -172,19 +186,17 @@ func (s *reassemblyStore) addFragment(fh FragmentHeader, payload []byte) (assemb
 	copy(data, payload)
 	buf.fragments[fh.FragmentIndex] = data
 	buf.received++
+	buf.totalBytes += len(payload)
 
 	if buf.received < buf.count {
 		return nil, false, nil
 	}
 
-	// All fragments received — concatenate in order.
-	total := 0
+	// All fragments received — concatenate in order with single-pass copy.
+	assembled = make([]byte, buf.totalBytes)
+	offset := 0
 	for _, f := range buf.fragments {
-		total += len(f)
-	}
-	assembled = make([]byte, 0, total)
-	for _, f := range buf.fragments {
-		assembled = append(assembled, f...)
+		offset += copy(assembled[offset:], f)
 	}
 	delete(s.buffers, fh.FragmentID)
 	return assembled, true, nil

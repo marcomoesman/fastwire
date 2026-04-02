@@ -215,6 +215,14 @@ func (ch *channel) deliverReliableOrdered(seq uint32, payload []byte) [][]byte {
 		delete(ch.recvBuffer, ch.recvNextDeliver)
 		ch.recvNextDeliver++
 	}
+
+	// If seq's payload is still buffered (out-of-order), make an independent
+	// copy so the caller can safely reuse or pool the original buffer.
+	if _, stillBuffered := ch.recvBuffer[seq]; stillBuffered {
+		cp := make([]byte, len(payload))
+		copy(cp, payload)
+		ch.recvBuffer[seq] = cp
+	}
 	return result
 }
 

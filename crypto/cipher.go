@@ -158,18 +158,18 @@ func Encrypt(state *CipherState, plaintext, dst []byte) ([]byte, error) {
 
 	nonce := state.nonce.Add(1)
 
-	// Build 12-byte AEAD nonce: LE uint64 in bytes 0-7, bytes 8-11 zero.
-	var aeadNonce [12]byte
-	binary.LittleEndian.PutUint64(aeadNonce[:8], nonce)
-
-	// Write 8-byte wire nonce to dst.
+	// Ensure dst has capacity for the full wire packet.
 	needed := NonceSize + len(plaintext) + TagSize
 	if cap(dst) < needed {
 		dst = make([]byte, needed)
 	} else {
 		dst = dst[:needed]
 	}
+
+	// Write 8-byte wire nonce to dst, then copy into 12-byte AEAD nonce.
 	binary.LittleEndian.PutUint64(dst[:NonceSize], nonce)
+	var aeadNonce [12]byte
+	copy(aeadNonce[:], dst[:NonceSize])
 
 	// Seal appends ciphertext+tag to dst[8:8].
 	state.aead.Seal(dst[NonceSize:NonceSize], aeadNonce[:], plaintext, nil)
