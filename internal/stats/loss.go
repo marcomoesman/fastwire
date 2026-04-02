@@ -63,11 +63,14 @@ func (lt *LossTracker) RecordAck(seq uint32) {
 	}
 }
 
-// Loss returns the current packet loss ratio (0.0-1.0). Lock-free.
+// Loss returns the current packet loss ratio (0.0-1.0).
 func (lt *LossTracker) Loss() float64 {
+	lt.mu.Lock()
 	c := lt.count.Load()
+	a := lt.ackCount.Load()
+	lt.mu.Unlock()
 	if c == 0 {
 		return 0.0
 	}
-	return 1.0 - float64(lt.ackCount.Load())/float64(c)
+	return 1.0 - float64(a)/float64(c)
 }

@@ -284,6 +284,7 @@ func (ch *channel) releasePendingBuffers() {
 		}
 	}
 	ch.pendingSend = nil
+	ch.recvBuffer = nil
 }
 
 // checkRetransmissions returns packets that need retransmission and a kill flag

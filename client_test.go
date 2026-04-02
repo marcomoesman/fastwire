@@ -64,6 +64,27 @@ func TestClientConnectTimeout(t *testing.T) {
 	}
 }
 
+func TestConnectTimeoutNoLeak(t *testing.T) {
+	config := DefaultClientConfig()
+	config.ConnectTimeout = 200 * time.Millisecond
+
+	cli, err := NewClient(config, newTestHandler())
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	// Connect to a non-listening address — will timeout.
+	err = cli.Connect("127.0.0.1:19999")
+	if err != ErrHandshakeTimeout {
+		t.Fatalf("Connect = %v, want ErrHandshakeTimeout", err)
+	}
+
+	// After timeout, server connection must be nil (no leaked connection).
+	if conn := cli.Connection(); conn != nil {
+		t.Fatal("Connection() should be nil after timeout, got non-nil (leaked connection)")
+	}
+}
+
 func TestClientSendReceive(t *testing.T) {
 	srvHandler := newTestHandler()
 	srv := startTestServer(t, DefaultServerConfig(), srvHandler)

@@ -75,10 +75,16 @@ func BatchOverhead(n int) int {
 
 // flushBatch packs the connection's batch buffer into batched datagrams and sends them.
 func (c *Connection) flushBatch(mtu int) error {
+	c.batchMu.Lock()
 	if len(c.batchBuf) == 0 {
+		c.batchMu.Unlock()
 		return nil
 	}
-	defer func() { c.batchBuf = c.batchBuf[:0] }()
+	// Swap out the pending packets under lock; process without lock.
+	pending := make([][]byte, len(c.batchBuf))
+	copy(pending, c.batchBuf)
+	c.batchBuf = c.batchBuf[:0]
+	c.batchMu.Unlock()
 
 	var dgBuf []byte
 	pktCount := 0
@@ -95,7 +101,7 @@ func (c *Connection) flushBatch(mtu int) error {
 		return err
 	}
 
-	for _, pkt := range c.batchBuf {
+	for _, pkt := range pending {
 		entrySize := BatchLenSize + len(pkt)
 
 		// If a single packet doesn't fit in a fresh datagram, send as a single-packet batch.

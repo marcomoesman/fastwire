@@ -334,6 +334,7 @@ func (s *Server) ForEachConnection(fn func(*Connection)) {
 
 func (s *Server) readLoop() {
 	defer s.wg.Done()
+	consecutiveErrors := 0
 	for {
 		buf := s.readPool.Get().([]byte)
 		n, addr, err := s.conn.ReadFromUDPAddrPort(buf)
@@ -343,9 +344,17 @@ func (s *Server) readLoop() {
 			case <-s.closeCh:
 				return
 			default:
-				continue
 			}
+			consecutiveErrors++
+			backoff := time.Duration(1<<min(consecutiveErrors, 7)) * time.Millisecond
+			select {
+			case <-time.After(backoff):
+			case <-s.closeCh:
+				return
+			}
+			continue
 		}
+		consecutiveErrors = 0
 		pkt := incomingPacket{
 			addr: addr,
 			data: buf[:n],
@@ -510,10 +519,16 @@ func (s *Server) processConnData(conn *Connection, data []byte) {
 func (s *Server) setupConnection(conn *Connection, addr netip.AddrPort) {
 	s.setupSendFunc(conn, addr)
 	conn.closeFunc = func() {
-		s.conns.remove(addr)
-		if conn.features&byte(FeatureConnectionMigration) != 0 {
-			s.tokens.remove(conn.migrationToken)
-		}
+		s.removeConnection(conn)
+	}
+}
+
+// removeConnection removes a connection from all server tables (address map + token table).
+// Uses conn.RemoteAddr() so it always references the current address, even after migration.
+func (s *Server) removeConnection(conn *Connection) {
+	s.conns.remove(conn.RemoteAddr())
+	if conn.features&byte(FeatureConnectionMigration) != 0 {
+		s.tokens.remove(conn.migrationToken)
 	}
 }
 
@@ -641,12 +656,9 @@ func (s *Server) processPacket(conn *Connection, data []byte) {
 			return
 		case ControlDisconnect:
 			conn.releasePendingBuffers()
-	
+
 			conn.setState(StateDisconnected)
-			s.conns.remove(conn.remoteAddr)
-			if conn.features&byte(FeatureConnectionMigration) != 0 {
-				s.tokens.remove(conn.migrationToken)
-			}
+			s.removeConnection(conn)
 			s.handler.OnDisconnect(conn, DisconnectGraceful)
 			return
 		default:
@@ -711,12 +723,9 @@ func (s *Server) tickConnection(conn *Connection, now time.Time) {
 		if retries >= maxDisconnectRetries {
 			// Max retries reached — force close.
 			conn.releasePendingBuffers()
-	
+
 			conn.setState(StateDisconnected)
-			s.conns.remove(conn.remoteAddr)
-			if conn.features&byte(FeatureConnectionMigration) != 0 {
-				s.tokens.remove(conn.migrationToken)
-			}
+			s.removeConnection(conn)
 			s.handler.OnDisconnect(conn, DisconnectGraceful)
 			return
 		}
@@ -740,10 +749,7 @@ func (s *Server) tickConnection(conn *Connection, now time.Time) {
 		conn.releasePendingBuffers()
 
 		conn.setState(StateDisconnected)
-		s.conns.remove(conn.remoteAddr)
-		if conn.features&byte(FeatureConnectionMigration) != 0 {
-			s.tokens.remove(conn.migrationToken)
-		}
+		s.removeConnection(conn)
 		s.handler.OnDisconnect(conn, DisconnectTimeout)
 		return
 	}
@@ -757,12 +763,9 @@ func (s *Server) tickConnection(conn *Connection, now time.Time) {
 		retransmits, kill := ch.checkRetransmissions(now, rto, s.config.MaxRetransmits)
 		if kill {
 			conn.releasePendingBuffers()
-	
+
 			conn.setState(StateDisconnected)
-			s.conns.remove(conn.remoteAddr)
-			if conn.features&byte(FeatureConnectionMigration) != 0 {
-				s.tokens.remove(conn.migrationToken)
-			}
+			s.removeConnection(conn)
 			s.handler.OnError(conn, ErrMaxRetransmits)
 			s.handler.OnDisconnect(conn, DisconnectError)
 			return

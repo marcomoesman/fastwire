@@ -113,6 +113,42 @@ func TestBatchOverhead(t *testing.T) {
 	}
 }
 
+func TestBatchBufferOverflow(t *testing.T) {
+	// Verify that writeEncrypted falls through to sendFramed when batch is full.
+	var sent [][]byte
+	conn := &Connection{
+		batchEnabled: true,
+		sendFunc: func(data []byte) error {
+			cp := make([]byte, len(data))
+			copy(cp, data)
+			sent = append(sent, cp)
+			return nil
+		},
+	}
+
+	// Fill batch buffer to capacity.
+	for range maxBatchQueueSize {
+		if err := conn.writeEncrypted([]byte("pkt")); err != nil {
+			t.Fatalf("writeEncrypted: %v", err)
+		}
+	}
+
+	conn.batchMu.Lock()
+	buffered := len(conn.batchBuf)
+	conn.batchMu.Unlock()
+	if buffered != maxBatchQueueSize {
+		t.Fatalf("batchBuf len = %d, want %d", buffered, maxBatchQueueSize)
+	}
+
+	// Next packet should be sent immediately via sendFramed.
+	if err := conn.writeEncrypted([]byte("overflow")); err != nil {
+		t.Fatalf("overflow writeEncrypted: %v", err)
+	}
+	if len(sent) != 1 {
+		t.Fatalf("sent count = %d, want 1 (overflow packet)", len(sent))
+	}
+}
+
 func TestBatchRoundTripEmptyPackets(t *testing.T) {
 	pkts := [][]byte{{}, {}, {}}
 	dst := make([]byte, 64)

@@ -304,6 +304,46 @@ func TestUUIDBufferTooSmall(t *testing.T) {
 	}
 }
 
+func TestPutVarIntBufferTooSmall(t *testing.T) {
+	// Value 300 needs 2 bytes (0xAC 0x02).
+	if n := PutVarInt(nil, 0); n != 0 {
+		t.Fatalf("nil buf: got %d, want 0", n)
+	}
+	if n := PutVarInt(make([]byte, 1), 300); n != 0 {
+		t.Fatalf("1-byte buf for 2-byte value: got %d, want 0", n)
+	}
+	// Value 0 fits in 1 byte — should succeed with 1-byte buffer.
+	if n := PutVarInt(make([]byte, 1), 0); n != 1 {
+		t.Fatalf("1-byte buf for 1-byte value: got %d, want 1", n)
+	}
+}
+
+func TestPutVarLongBufferTooSmall(t *testing.T) {
+	if n := PutVarLong(nil, 0); n != 0 {
+		t.Fatalf("nil buf: got %d, want 0", n)
+	}
+	if n := PutVarLong(make([]byte, 1), 300); n != 0 {
+		t.Fatalf("1-byte buf for 2-byte value: got %d, want 0", n)
+	}
+	if n := PutVarLong(make([]byte, 1), 0); n != 1 {
+		t.Fatalf("1-byte buf for 1-byte value: got %d, want 1", n)
+	}
+}
+
+func TestPutUUIDBufferTooSmall(t *testing.T) {
+	id := UUIDFromInts(1, 2)
+	if n := PutUUID(make([]byte, 15), id); n != 0 {
+		t.Fatalf("15-byte buf: got %d, want 0", n)
+	}
+	if n := PutUUID(nil, id); n != 0 {
+		t.Fatalf("nil buf: got %d, want 0", n)
+	}
+	// Exactly 16 bytes should succeed.
+	if n := PutUUID(make([]byte, 16), id); n != 16 {
+		t.Fatalf("16-byte buf: got %d, want 16", n)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Benchmarks
 // ---------------------------------------------------------------------------

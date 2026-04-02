@@ -15,9 +15,15 @@ import (
 func PutVarInt(buf []byte, v uint32) int {
 	i := 0
 	for v >= 0x80 {
+		if i >= len(buf) {
+			return 0
+		}
 		buf[i] = byte(v) | 0x80
 		v >>= 7
 		i++
+	}
+	if i >= len(buf) {
+		return 0
 	}
 	buf[i] = byte(v)
 	return i + 1
@@ -50,9 +56,15 @@ func ReadVarInt(buf []byte) (uint32, int, error) {
 func PutVarLong(buf []byte, v uint64) int {
 	i := 0
 	for v >= 0x80 {
+		if i >= len(buf) {
+			return 0
+		}
 		buf[i] = byte(v) | 0x80
 		v >>= 7
 		i++
+	}
+	if i >= len(buf) {
+		return 0
 	}
 	buf[i] = byte(v)
 	return i + 1
@@ -128,6 +140,9 @@ type UUID [16]byte
 // Returns 16 (the number of bytes written). The caller must ensure buf has at
 // least 16 bytes.
 func PutUUID(buf []byte, id UUID) int {
+	if len(buf) < 16 {
+		return 0
+	}
 	copy(buf, id[:])
 	return 16
 }

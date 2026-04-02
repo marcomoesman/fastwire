@@ -79,6 +79,10 @@ type outgoingMessage struct {
 // maxDisconnectRetries is the number of times a disconnect packet is retried.
 const maxDisconnectRetries = 3
 
+// maxBatchQueueSize is the maximum number of packets that can accumulate in
+// the batch buffer between flushes. Packets beyond this limit are sent immediately.
+const maxBatchQueueSize = 256
+
 // Connection represents a FastWire connection to a remote peer.
 type Connection struct {
 	mu         sync.Mutex
@@ -124,6 +128,7 @@ type Connection struct {
 
 	// Send batching state.
 	batchEnabled bool
+	batchMu      sync.Mutex  // protects batchBuf
 	batchBuf     [][]byte
 	skipBatch    atomic.Bool // true during SendImmediate
 }
@@ -141,7 +146,7 @@ func newConnection(addr netip.AddrPort, sendCipher, recvCipher *fwcrypto.CipherS
 		channels:       newChannels(layout),
 		rttState:       rtt.New(),
 		layout:         layout,
-		reassembly:     newReassemblyStore(),
+		reassembly:     newReassemblyStore(DefaultFragmentTimeout),
 		compress:       cp,
 		cc:             congestion.NewController(congestionMode, initialCwnd),
 		createdAt:      now,
@@ -355,6 +360,7 @@ func (c *Connection) releasePendingBuffers() {
 	for _, ch := range c.channels {
 		ch.releasePendingBuffers()
 	}
+	c.reassembly.reset()
 }
 
 // queueMessage adds a message to the send queue (caller holds no lock).
@@ -402,7 +408,13 @@ func (c *Connection) sendFramed(encrypted []byte) error {
 // or sending immediately (wrapped in frame if batching is active).
 func (c *Connection) writeEncrypted(encrypted []byte) error {
 	if c.batchEnabled && !c.skipBatch.Load() {
+		c.batchMu.Lock()
+		if len(c.batchBuf) >= maxBatchQueueSize {
+			c.batchMu.Unlock()
+			return c.sendFramed(encrypted)
+		}
 		c.batchBuf = append(c.batchBuf, encrypted)
+		c.batchMu.Unlock()
 		return nil
 	}
 	return c.sendFramed(encrypted)

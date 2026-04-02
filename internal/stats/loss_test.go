@@ -132,13 +132,25 @@ func TestLossTrackerConcurrent(t *testing.T) {
 	lt := NewLossTracker()
 	var wg sync.WaitGroup
 
-	// Concurrent sends and acks.
+	// Concurrent sends, acks, and loss reads.
 	for i := uint32(1); i <= 200; i++ {
 		wg.Add(1)
 		go func(seq uint32) {
 			defer wg.Done()
 			lt.RecordSend(seq)
 		}(i)
+	}
+
+	// Concurrently read loss during sends — tests #5/#6 race fix.
+	for range 50 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			loss := lt.Loss()
+			if loss < 0.0 || loss > 1.0 {
+				t.Errorf("loss during sends = %f, want [0.0, 1.0]", loss)
+			}
+		}()
 	}
 	wg.Wait()
 
@@ -149,11 +161,23 @@ func TestLossTrackerConcurrent(t *testing.T) {
 			lt.RecordAck(seq)
 		}(i)
 	}
+
+	// Concurrently read loss during acks.
+	for range 50 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			loss := lt.Loss()
+			if loss < 0.0 || loss > 1.0 {
+				t.Errorf("loss during acks = %f, want [0.0, 1.0]", loss)
+			}
+		}()
+	}
 	wg.Wait()
 
-	// Loss should be valid (between 0 and 1).
+	// Final loss should be valid.
 	loss := lt.Loss()
 	if loss < 0.0 || loss > 1.0 {
-		t.Fatalf("concurrent loss = %f, want [0.0, 1.0]", loss)
+		t.Fatalf("final concurrent loss = %f, want [0.0, 1.0]", loss)
 	}
 }

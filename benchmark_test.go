@@ -152,7 +152,7 @@ func benchmarkRecvPath(b *testing.B, cfg benchSendConfig) {
 				b.Fatal(err)
 			}
 			receiver.recvCipher = recvCS
-			receiver.reassembly = newReassemblyStore()
+			receiver.reassembly = newReassemblyStore(5 * time.Second)
 			for _, ch := range receiver.channels {
 				ch.mu.Lock()
 				ch.recvAck = 0

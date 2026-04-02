@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	fwcrypto "github.com/marcomoesman/fastwire/crypto"
 )
@@ -499,7 +500,7 @@ func TestCompressFragmentReassembleDecompress(t *testing.T) {
 			}
 
 			// Step 3: Reassemble.
-			store := newReassemblyStore()
+			store := newReassemblyStore(5 * time.Second)
 			var assembled []byte
 			var complete bool
 			for _, frag := range frags {

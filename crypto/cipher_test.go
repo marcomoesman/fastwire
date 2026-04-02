@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
+	"sync"
 	"testing"
 )
 
@@ -304,6 +305,45 @@ func TestReplayWindowLargeJump(t *testing.T) {
 	if !rw.check(1999) {
 		t.Fatal("nonce 1999 should be accepted (within window of 2000)")
 	}
+}
+
+func TestDecryptConcurrent(t *testing.T) {
+	send, recv := makeTestCipherStates(t, CipherAES128GCM)
+	plaintext := []byte("concurrent test payload")
+
+	const numPackets = 200
+	packets := make([][]byte, numPackets)
+	for i := range numPackets {
+		enc, err := Encrypt(send, plaintext, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		packets[i] = enc
+	}
+
+	// Decrypt all packets from multiple goroutines concurrently.
+	var wg sync.WaitGroup
+	const numWorkers = 8
+	perWorker := numPackets / numWorkers
+
+	for w := range numWorkers {
+		wg.Add(1)
+		go func(start int) {
+			defer wg.Done()
+			for i := start; i < start+perWorker; i++ {
+				dec, err := Decrypt(recv, packets[i], nil)
+				if err != nil {
+					t.Errorf("packet %d: %v", i, err)
+					return
+				}
+				if !bytes.Equal(dec, plaintext) {
+					t.Errorf("packet %d: decrypted mismatch", i)
+					return
+				}
+			}
+		}(w * perWorker)
+	}
+	wg.Wait()
 }
 
 // --- Failure cases ---

@@ -27,6 +27,7 @@ type Client struct {
 	connectDoneOnce sync.Once
 	connectErr      error
 	connected       bool
+	connectAborted  bool
 
 	// Read buffer pool.
 	readPool *sync.Pool
@@ -135,6 +136,7 @@ func (c *Client) Connect(addr string) error {
 	c.connectDone = make(chan struct{})
 	c.connectDoneOnce = sync.Once{}
 	c.connectErr = nil
+	c.connectAborted = false
 
 	c.readPool = newReadPool(c.config.MTU + fwcrypto.WireOverhead + MigrationTokenSize + BatchHeaderSize)
 
@@ -154,6 +156,9 @@ func (c *Client) Connect(addr string) error {
 			return c.connectErr
 		}
 	case <-time.After(c.config.ConnectTimeout):
+		c.mu.Lock()
+		c.connectAborted = true
+		c.mu.Unlock()
 		c.closeOnce.Do(func() {
 			close(c.closeCh)
 			c.conn.Close()
@@ -259,6 +264,7 @@ func (c *Client) Connection() *Connection {
 
 func (c *Client) readLoop() {
 	defer c.wg.Done()
+	consecutiveErrors := 0
 	for {
 		buf := c.readPool.Get().([]byte)
 		n, err := c.conn.Read(buf)
@@ -268,9 +274,17 @@ func (c *Client) readLoop() {
 			case <-c.closeCh:
 				return
 			default:
-				continue
 			}
+			consecutiveErrors++
+			backoff := time.Duration(1<<min(consecutiveErrors, 7)) * time.Millisecond
+			select {
+			case <-time.After(backoff):
+			case <-c.closeCh:
+				return
+			}
+			continue
 		}
+		consecutiveErrors = 0
 
 		c.mu.Lock()
 		connected := c.connected
@@ -344,6 +358,10 @@ func (c *Client) handleChallenge(data []byte) {
 		challenge.Features, challenge.MigrationToken)
 
 	c.mu.Lock()
+	if c.connectAborted {
+		c.mu.Unlock()
+		return
+	}
 	c.server = conn
 	c.mu.Unlock()
 

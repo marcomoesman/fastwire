@@ -92,7 +92,7 @@ func TestSplitReassembleRoundTrip(t *testing.T) {
 		t.Fatalf("expected 4 fragments, got %d", len(frags))
 	}
 
-	store := newReassemblyStore()
+	store := newReassemblyStore(5 * time.Second)
 	for _, frag := range frags {
 		fh, n, err := UnmarshalFragmentHeader(frag)
 		if err != nil {
@@ -129,7 +129,7 @@ func TestOutOfOrderReassembly(t *testing.T) {
 	}
 
 	// Feed in reverse order.
-	store := newReassemblyStore()
+	store := newReassemblyStore(5 * time.Second)
 	for i := len(frags) - 1; i >= 0; i-- {
 		fh, n, err := UnmarshalFragmentHeader(frags[i])
 		if err != nil {
@@ -165,7 +165,7 @@ func TestDuplicateFragment(t *testing.T) {
 		t.Fatalf("splitMessage: %v", err)
 	}
 
-	store := newReassemblyStore()
+	store := newReassemblyStore(5 * time.Second)
 
 	// Feed first fragment.
 	fh0, n0, _ := UnmarshalFragmentHeader(frags[0])
@@ -192,7 +192,7 @@ func TestDuplicateFragment(t *testing.T) {
 }
 
 func TestCountMismatch(t *testing.T) {
-	store := newReassemblyStore()
+	store := newReassemblyStore(5 * time.Second)
 
 	// First fragment says count=3.
 	fh1 := FragmentHeader{FragmentID: 10, FragmentIndex: 0, FragmentCount: 3, FragmentFlags: 0}
@@ -210,7 +210,7 @@ func TestCountMismatch(t *testing.T) {
 }
 
 func TestFlagsMismatch(t *testing.T) {
-	store := newReassemblyStore()
+	store := newReassemblyStore(5 * time.Second)
 
 	fh1 := FragmentHeader{FragmentID: 11, FragmentIndex: 0, FragmentCount: 2, FragmentFlags: FragFlagCompressed}
 	_, _, err := store.addFragment(fh1, []byte("data"))
@@ -226,7 +226,7 @@ func TestFlagsMismatch(t *testing.T) {
 }
 
 func TestStaleBufferCleanup(t *testing.T) {
-	store := newReassemblyStore()
+	store := newReassemblyStore(5 * time.Second)
 
 	fh := FragmentHeader{FragmentID: 20, FragmentIndex: 0, FragmentCount: 3, FragmentFlags: 0}
 	_, _, err := store.addFragment(fh, []byte("data"))
@@ -273,7 +273,7 @@ func TestSingleFragmentEnvelope(t *testing.T) {
 		t.Fatalf("flags mismatch: got %d", fh.FragmentFlags)
 	}
 
-	store := newReassemblyStore()
+	store := newReassemblyStore(5 * time.Second)
 	assembled, complete, err := store.addFragment(fh, frags[0][n:])
 	if err != nil || !complete {
 		t.Fatalf("single fragment: err=%v complete=%v", err, complete)
@@ -312,7 +312,7 @@ func TestEmptyPayload(t *testing.T) {
 		t.Fatalf("expected empty chunk, got %d bytes", len(frags[0][n:]))
 	}
 
-	store := newReassemblyStore()
+	store := newReassemblyStore(5 * time.Second)
 	assembled, complete, err := store.addFragment(fh, frags[0][n:])
 	if err != nil || !complete {
 		t.Fatalf("empty reassembly: err=%v complete=%v", err, complete)
@@ -371,7 +371,7 @@ func TestMaxFragments255(t *testing.T) {
 }
 
 func TestInvalidIndex(t *testing.T) {
-	store := newReassemblyStore()
+	store := newReassemblyStore(5 * time.Second)
 	fh := FragmentHeader{FragmentID: 30, FragmentIndex: 5, FragmentCount: 3, FragmentFlags: 0}
 	_, _, err := store.addFragment(fh, []byte("data"))
 	if err != ErrInvalidFragmentHeader {
@@ -380,7 +380,7 @@ func TestInvalidIndex(t *testing.T) {
 }
 
 func TestZeroCount(t *testing.T) {
-	store := newReassemblyStore()
+	store := newReassemblyStore(5 * time.Second)
 	fh := FragmentHeader{FragmentID: 31, FragmentIndex: 0, FragmentCount: 0, FragmentFlags: 0}
 	_, _, err := store.addFragment(fh, []byte("data"))
 	if err != ErrInvalidFragmentHeader {
@@ -424,10 +424,71 @@ func BenchmarkFragmentReassemble(b *testing.B) {
 	}
 	b.ResetTimer()
 	for b.Loop() {
-		store := newReassemblyStore()
+		store := newReassemblyStore(5 * time.Second)
 		for _, pf := range parsed {
 			_, _, _ = store.addFragment(pf.hdr, pf.payload)
 		}
+	}
+}
+
+func TestFragmentIDReuseAfterTimeout(t *testing.T) {
+	store := newReassemblyStore(100 * time.Millisecond)
+
+	// Add partial fragments for ID 1 with 3 fragments.
+	fh := FragmentHeader{FragmentID: 1, FragmentIndex: 0, FragmentCount: 3}
+	_, complete, err := store.addFragment(fh, []byte("old-frag-0"))
+	if err != nil || complete {
+		t.Fatalf("unexpected: err=%v complete=%v", err, complete)
+	}
+	if store.pending() != 1 {
+		t.Fatalf("pending = %d, want 1", store.pending())
+	}
+
+	// Wait for the buffer to become stale.
+	time.Sleep(150 * time.Millisecond)
+
+	// Add new fragment with same ID but different count (simulates ID reuse after wrap).
+	fhNew := FragmentHeader{FragmentID: 1, FragmentIndex: 0, FragmentCount: 2}
+	_, complete, err = store.addFragment(fhNew, []byte("new-frag-0"))
+	if err != nil {
+		t.Fatalf("addFragment after stale eviction: %v", err)
+	}
+	if complete {
+		t.Fatal("should not be complete with 1/2 fragments")
+	}
+
+	// Complete the new reassembly.
+	fhNew1 := FragmentHeader{FragmentID: 1, FragmentIndex: 1, FragmentCount: 2}
+	assembled, complete, err := store.addFragment(fhNew1, []byte("new-frag-1"))
+	if err != nil {
+		t.Fatalf("addFragment: %v", err)
+	}
+	if !complete {
+		t.Fatal("should be complete with 2/2 fragments")
+	}
+	expected := "new-frag-0new-frag-1"
+	if string(assembled) != expected {
+		t.Fatalf("assembled = %q, want %q", assembled, expected)
+	}
+}
+
+func TestReassemblyStoreReset(t *testing.T) {
+	store := newReassemblyStore(5 * time.Second)
+
+	// Add partial fragments for two different IDs.
+	fh1 := FragmentHeader{FragmentID: 1, FragmentIndex: 0, FragmentCount: 3}
+	fh2 := FragmentHeader{FragmentID: 2, FragmentIndex: 0, FragmentCount: 2}
+	store.addFragment(fh1, []byte("frag-1-0"))
+	store.addFragment(fh2, []byte("frag-2-0"))
+
+	if store.pending() != 2 {
+		t.Fatalf("pending = %d, want 2", store.pending())
+	}
+
+	store.reset()
+
+	if store.pending() != 0 {
+		t.Fatalf("pending after reset = %d, want 0", store.pending())
 	}
 }
 

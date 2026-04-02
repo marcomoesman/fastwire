@@ -136,13 +136,15 @@ type reassemblyBuffer struct {
 
 // reassemblyStore manages in-progress fragment reassembly keyed by fragment ID.
 type reassemblyStore struct {
-	mu      sync.Mutex
-	buffers map[uint16]*reassemblyBuffer
+	mu              sync.Mutex
+	buffers         map[uint16]*reassemblyBuffer
+	fragmentTimeout time.Duration
 }
 
-func newReassemblyStore() *reassemblyStore {
+func newReassemblyStore(fragmentTimeout time.Duration) *reassemblyStore {
 	return &reassemblyStore{
-		buffers: make(map[uint16]*reassemblyBuffer),
+		buffers:         make(map[uint16]*reassemblyBuffer),
+		fragmentTimeout: fragmentTimeout,
 	}
 }
 
@@ -161,6 +163,13 @@ func (s *reassemblyStore) addFragment(fh FragmentHeader, payload []byte) (assemb
 	defer s.mu.Unlock()
 
 	buf, exists := s.buffers[fh.FragmentID]
+	if exists {
+		// Evict stale buffer on fragment ID reuse (e.g. after uint16 wrap).
+		if s.fragmentTimeout > 0 && time.Since(buf.createdAt) >= s.fragmentTimeout {
+			delete(s.buffers, fh.FragmentID)
+			exists = false
+		}
+	}
 	if exists {
 		// Validate consistency with existing buffer.
 		if buf.count != int(fh.FragmentCount) || buf.flags != fh.FragmentFlags {
@@ -216,6 +225,13 @@ func (s *reassemblyStore) cleanup(timeout time.Duration) int {
 		}
 	}
 	return removed
+}
+
+// reset clears all in-progress reassembly buffers. Called during connection teardown.
+func (s *reassemblyStore) reset() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	clear(s.buffers)
 }
 
 // pending returns the number of incomplete reassembly buffers.

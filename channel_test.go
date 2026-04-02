@@ -552,6 +552,25 @@ func TestReleasePendingBuffersEmpty(t *testing.T) {
 	ch.releasePendingBuffers()
 }
 
+func TestReleasePendingBuffersClearsRecvBuffer(t *testing.T) {
+	ch := &channel{mode: ReliableOrdered, recvBuffer: make(map[uint32][]byte), recvNextDeliver: 1}
+
+	// Simulate out-of-order buffered payloads.
+	ch.recvBuffer[5] = []byte("payload-5")
+	ch.recvBuffer[6] = []byte("payload-6")
+	ch.recvBuffer[8] = []byte("payload-8")
+
+	if len(ch.recvBuffer) != 3 {
+		t.Fatalf("recvBuffer len = %d, want 3", len(ch.recvBuffer))
+	}
+
+	ch.releasePendingBuffers()
+
+	if ch.recvBuffer != nil {
+		t.Fatalf("recvBuffer should be nil after release, got len %d", len(ch.recvBuffer))
+	}
+}
+
 // --- newChannels test ---
 
 func TestNewChannels(t *testing.T) {

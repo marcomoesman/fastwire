@@ -4,6 +4,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"encoding/binary"
+	"sync"
 	"sync/atomic"
 
 	"golang.org/x/crypto/chacha20poly1305"
@@ -20,6 +21,7 @@ const (
 
 // replayWindow implements a 1024-bit sliding window for replay protection.
 type replayWindow struct {
+	mu       sync.Mutex
 	maxNonce uint64
 	window   [16]uint64 // 1024-bit bitfield
 }
@@ -200,23 +202,28 @@ func Decrypt(state *CipherState, packet, dst []byte) ([]byte, error) {
 	// Read wire nonce.
 	nonce := binary.LittleEndian.Uint64(packet[:NonceSize])
 
-	// Check replay window.
+	// Check replay window (lock protects concurrent access to window state).
+	state.replay.mu.Lock()
 	if !state.replay.check(nonce) {
+		state.replay.mu.Unlock()
 		return nil, ErrReplayedPacket
 	}
+	state.replay.mu.Unlock()
 
 	// Build 12-byte AEAD nonce.
 	var aeadNonce [12]byte
 	binary.LittleEndian.PutUint64(aeadNonce[:8], nonce)
 
-	// Decrypt.
+	// Decrypt (expensive AEAD Open runs without holding replay lock).
 	plaintext, err := state.aead.Open(dst[:0], aeadNonce[:], packet[NonceSize:], nil)
 	if err != nil {
 		return nil, ErrDecryptionFailed
 	}
 
 	// Update replay window only after successful decryption.
+	state.replay.mu.Lock()
 	state.replay.update(nonce)
+	state.replay.mu.Unlock()
 
 	return plaintext, nil
 }
