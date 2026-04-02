@@ -2,6 +2,8 @@ package fastwire
 
 import (
 	"bytes"
+	"hash/fnv"
+	"net/netip"
 	"strings"
 	"sync"
 	"testing"
@@ -118,6 +120,32 @@ func connectTestClient(t *testing.T, config ClientConfig, handler Handler, serve
 	return cli
 }
 
+func TestShardForMatchesFNV(t *testing.T) {
+	ct := newConnectionTable()
+	addrs := []netip.AddrPort{
+		netip.MustParseAddrPort("127.0.0.1:9000"),
+		netip.MustParseAddrPort("[::1]:443"),
+		netip.MustParseAddrPort("192.168.1.1:65535"),
+		netip.MustParseAddrPort("10.0.0.1:0"),
+		netip.MustParseAddrPort("[2001:db8::1]:8080"),
+	}
+	for _, addr := range addrs {
+		// Compute expected hash using stdlib FNV-1a.
+		h := fnv.New32a()
+		b := addr.Addr().As16()
+		h.Write(b[:])
+		var portBuf [2]byte
+		portBuf[0] = byte(addr.Port() >> 8)
+		portBuf[1] = byte(addr.Port())
+		h.Write(portBuf[:])
+		expected := &ct.shards[h.Sum32()%connShardCount]
+		got := ct.shardFor(addr)
+		if got != expected {
+			t.Fatalf("shard mismatch for %v", addr)
+		}
+	}
+}
+
 func TestNewServer(t *testing.T) {
 	h := newTestHandler()
 	srv, err := NewServer("127.0.0.1:0", ServerConfig{}, h)
@@ -230,11 +258,9 @@ func TestServerConnectionTimeout(t *testing.T) {
 		t.Fatal("timed out waiting for connect")
 	}
 
-	// Force the server connection's lastRecvTime into the past.
+	// Force the server connection's lastRecvNano into the past.
 	srv.conns.forEach(func(conn *Connection) {
-		conn.mu.Lock()
-		conn.lastRecvTime = time.Now().Add(-1 * time.Second)
-		conn.mu.Unlock()
+		conn.lastRecvNano.Store(time.Now().Add(-1 * time.Second).UnixNano())
 	})
 
 	// Wait for timeout to be detected.

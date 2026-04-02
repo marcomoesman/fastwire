@@ -89,6 +89,7 @@ func (c *Connection) flushBatch(mtu int) error {
 		}
 		dgBuf[0] = byte(pktCount)
 		err := c.sendFunc(dgBuf)
+		putSendBuffer(dgBuf[:cap(dgBuf)])
 		dgBuf = nil
 		pktCount = 0
 		return err
@@ -102,18 +103,20 @@ func (c *Connection) flushBatch(mtu int) error {
 			if err := flush(); err != nil {
 				return err
 			}
-			single := make([]byte, BatchHeaderSize+entrySize)
+			single := getSendBuffer(BatchHeaderSize + entrySize)
 			single[0] = 1
 			binary.LittleEndian.PutUint16(single[1:], uint16(len(pkt)))
 			copy(single[3:], pkt)
-			if err := c.sendFunc(single); err != nil {
+			err := c.sendFunc(single[:BatchHeaderSize+entrySize])
+			putSendBuffer(single[:cap(single)])
+			if err != nil {
 				return err
 			}
 			continue
 		}
 
 		if dgBuf == nil {
-			dgBuf = make([]byte, 1, mtu)
+			dgBuf = getSendBuffer(mtu)[:1]
 		}
 
 		// Check if adding this packet would exceed MTU or max count.
@@ -121,7 +124,7 @@ func (c *Connection) flushBatch(mtu int) error {
 			if err := flush(); err != nil {
 				return err
 			}
-			dgBuf = make([]byte, 1, mtu)
+			dgBuf = getSendBuffer(mtu)[:1]
 		}
 
 		dgBuf = binary.LittleEndian.AppendUint16(dgBuf, uint16(len(pkt)))

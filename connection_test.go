@@ -91,10 +91,8 @@ func TestConnectionHeartbeatNeeded(t *testing.T) {
 		t.Fatal("should not need heartbeat immediately after creation")
 	}
 
-	// Force lastSendTime into the past.
-	conn.mu.Lock()
-	conn.lastSendTime = time.Now().Add(-2 * time.Second)
-	conn.mu.Unlock()
+	// Force lastSendNano into the past.
+	conn.lastSendNano.Store(time.Now().Add(-2 * time.Second).UnixNano())
 
 	if !conn.needsHeartbeat(1 * time.Second) {
 		t.Fatal("should need heartbeat after 2s with 1s interval")
@@ -113,9 +111,7 @@ func TestConnectionHeartbeatOnlyWhenConnected(t *testing.T) {
 	recv, _ := fwcrypto.NewCipherState(nil, CipherNone)
 	conn := newConnection(addr, send, recv, CipherNone, DefaultChannelLayout(), CompressionConfig{}, CongestionConservative, 0, 0, MigrationToken{})
 
-	conn.mu.Lock()
-	conn.lastSendTime = time.Now().Add(-2 * time.Second)
-	conn.mu.Unlock()
+	conn.lastSendNano.Store(time.Now().Add(-2 * time.Second).UnixNano())
 
 	// Disconnecting state should not need heartbeat.
 	conn.setState(StateDisconnecting)
@@ -135,10 +131,8 @@ func TestConnectionTimeout(t *testing.T) {
 		t.Fatal("should not be timed out immediately")
 	}
 
-	// Force lastRecvTime into the past.
-	conn.mu.Lock()
-	conn.lastRecvTime = time.Now().Add(-15 * time.Second)
-	conn.mu.Unlock()
+	// Force lastRecvNano into the past.
+	conn.lastRecvNano.Store(time.Now().Add(-15 * time.Second).UnixNano())
 
 	if !conn.isTimedOut(10 * time.Second) {
 		t.Fatal("should be timed out after 15s with 10s timeout")
@@ -260,6 +254,114 @@ func TestConcurrentSend(t *testing.T) {
 		case <-timeout:
 			t.Fatalf("timed out: received %d/%d messages", received, total)
 		}
+	}
+}
+
+// --- Pool buffer tests ---
+
+func TestSendPooledUnreliable(t *testing.T) {
+	addr := netip.MustParseAddrPort("127.0.0.1:9000")
+	send, _ := fwcrypto.NewCipherState(nil, CipherNone)
+	recv, _ := fwcrypto.NewCipherState(nil, CipherNone)
+	conn := newConnection(addr, send, recv, CipherNone, DefaultChannelLayout(), CompressionConfig{}, CongestionConservative, 0, 0, MigrationToken{})
+	conn.sendFunc = func(data []byte) error { return nil }
+
+	// Channel 2 is Unreliable — buffer should be returned immediately.
+	err := conn.sendMessage([]byte("unreliable data"), 2)
+	if err != nil {
+		t.Fatalf("sendMessage: %v", err)
+	}
+	// No pending packets on unreliable channel.
+	if cnt := conn.channels[2].pendingCount(); cnt != 0 {
+		t.Fatalf("unreliable pendingCount = %d, want 0", cnt)
+	}
+}
+
+func TestSendPooledReliable(t *testing.T) {
+	addr := netip.MustParseAddrPort("127.0.0.1:9000")
+	send, _ := fwcrypto.NewCipherState(nil, CipherNone)
+	recv, _ := fwcrypto.NewCipherState(nil, CipherNone)
+	conn := newConnection(addr, send, recv, CipherNone, DefaultChannelLayout(), CompressionConfig{}, CongestionConservative, 0, 0, MigrationToken{})
+	conn.sendFunc = func(data []byte) error { return nil }
+
+	// Channel 0 is ReliableOrdered — buffer should be stored in pendingPacket.
+	err := conn.sendMessage([]byte("reliable data"), 0)
+	if err != nil {
+		t.Fatalf("sendMessage: %v", err)
+	}
+
+	if cnt := conn.channels[0].pendingCount(); cnt != 1 {
+		t.Fatalf("reliable pendingCount = %d, want 1", cnt)
+	}
+
+	// Verify the pending packet has a poolBuf.
+	conn.channels[0].mu.Lock()
+	p := conn.channels[0].pendingSend[0]
+	conn.channels[0].mu.Unlock()
+
+	if p.poolBuf == nil {
+		t.Fatal("reliable pendingPacket should have non-nil poolBuf")
+	}
+	if len(p.raw) == 0 {
+		t.Fatal("reliable pendingPacket should have non-empty raw")
+	}
+}
+
+func TestSendPooledReliableAcked(t *testing.T) {
+	addr := netip.MustParseAddrPort("127.0.0.1:9000")
+	send, _ := fwcrypto.NewCipherState(nil, CipherNone)
+	recv, _ := fwcrypto.NewCipherState(nil, CipherNone)
+	conn := newConnection(addr, send, recv, CipherNone, DefaultChannelLayout(), CompressionConfig{}, CongestionConservative, 0, 0, MigrationToken{})
+	conn.sendFunc = func(data []byte) error { return nil }
+
+	// Send a reliable message.
+	err := conn.sendMessage([]byte("ack me"), 0)
+	if err != nil {
+		t.Fatalf("sendMessage: %v", err)
+	}
+
+	// Verify pending.
+	if cnt := conn.channels[0].pendingCount(); cnt != 1 {
+		t.Fatalf("pendingCount = %d, want 1", cnt)
+	}
+
+	// Ack the packet (seq=1).
+	acked := conn.channels[0].processAcks(1, 0, nil)
+	if len(acked) != 1 {
+		t.Fatalf("acked = %d, want 1", len(acked))
+	}
+	if conn.channels[0].pendingCount() != 0 {
+		t.Fatal("pendingCount should be 0 after ack")
+	}
+}
+
+func TestReleasePendingBuffersConnection(t *testing.T) {
+	addr := netip.MustParseAddrPort("127.0.0.1:9000")
+	send, _ := fwcrypto.NewCipherState(nil, CipherNone)
+	recv, _ := fwcrypto.NewCipherState(nil, CipherNone)
+	conn := newConnection(addr, send, recv, CipherNone, DefaultChannelLayout(), CompressionConfig{}, CongestionConservative, 0, 0, MigrationToken{})
+	conn.sendFunc = func(data []byte) error { return nil }
+
+	// Send messages on both reliable channels.
+	for range 5 {
+		_ = conn.sendMessage([]byte("data"), 0) // ReliableOrdered
+		_ = conn.sendMessage([]byte("data"), 1) // ReliableUnordered
+	}
+
+	if conn.channels[0].pendingCount() != 5 {
+		t.Fatalf("ch0 pendingCount = %d, want 5", conn.channels[0].pendingCount())
+	}
+	if conn.channels[1].pendingCount() != 5 {
+		t.Fatalf("ch1 pendingCount = %d, want 5", conn.channels[1].pendingCount())
+	}
+
+	conn.releasePendingBuffers()
+
+	if conn.channels[0].pendingCount() != 0 {
+		t.Fatalf("ch0 pendingCount after release = %d", conn.channels[0].pendingCount())
+	}
+	if conn.channels[1].pendingCount() != 0 {
+		t.Fatalf("ch1 pendingCount after release = %d", conn.channels[1].pendingCount())
 	}
 }
 

@@ -1,7 +1,6 @@
 package fastwire
 
 import (
-	"hash/fnv"
 	"net"
 	"net/netip"
 	"runtime"
@@ -16,6 +15,7 @@ type incomingPacket struct {
 	addr netip.AddrPort
 	data []byte
 	n    int
+	buf  []byte // original full buffer for pool return; nil if not pooled
 }
 
 // --- connection table ---
@@ -40,14 +40,18 @@ func newConnectionTable() *connectionTable {
 }
 
 func (ct *connectionTable) shardFor(addr netip.AddrPort) *connShard {
-	h := fnv.New32a()
 	b := addr.Addr().As16()
-	_, _ = h.Write(b[:])
-	var portBuf [2]byte
-	portBuf[0] = byte(addr.Port() >> 8)
-	portBuf[1] = byte(addr.Port())
-	_, _ = h.Write(portBuf[:])
-	return &ct.shards[h.Sum32()%connShardCount]
+	h := uint32(2166136261) // FNV-1a offset basis
+	for _, c := range b {
+		h ^= uint32(c)
+		h *= 16777619 // FNV-1a prime
+	}
+	p := addr.Port()
+	h ^= uint32(p >> 8)
+	h *= 16777619
+	h ^= uint32(p & 0xFF)
+	h *= 16777619
+	return &ct.shards[h%connShardCount]
 }
 
 func (ct *connectionTable) get(addr netip.AddrPort) *Connection {
@@ -162,6 +166,9 @@ type Server struct {
 	// Write coalescing.
 	writeCh chan writeRequest
 
+	// Read buffer pool.
+	readPool *sync.Pool
+
 	// Computed server features.
 	serverFeatures byte
 }
@@ -238,6 +245,8 @@ func (s *Server) Start() error {
 	s.started = true
 	s.mu.Unlock()
 
+	s.readPool = newReadPool(s.config.MTU + fwcrypto.WireOverhead + MigrationTokenSize + BatchHeaderSize)
+
 	// Start read goroutine(s).
 	readers := 1
 	if s.config.CoalesceIO && s.config.CoalesceReaders > 1 {
@@ -281,6 +290,8 @@ func (s *Server) Stop() error {
 
 	// Disconnect all remaining connections.
 	s.conns.forEach(func(conn *Connection) {
+		conn.releasePendingBuffers()
+
 		conn.setState(StateDisconnected)
 		s.handler.OnDisconnect(conn, DisconnectGraceful)
 	})
@@ -324,9 +335,10 @@ func (s *Server) ForEachConnection(fn func(*Connection)) {
 func (s *Server) readLoop() {
 	defer s.wg.Done()
 	for {
-		buf := make([]byte, s.config.MTU+fwcrypto.WireOverhead+MigrationTokenSize+BatchHeaderSize)
+		buf := s.readPool.Get().([]byte)
 		n, addr, err := s.conn.ReadFromUDPAddrPort(buf)
 		if err != nil {
+			s.readPool.Put(buf)
 			select {
 			case <-s.closeCh:
 				return
@@ -338,10 +350,12 @@ func (s *Server) readLoop() {
 			addr: addr,
 			data: buf[:n],
 			n:    n,
+			buf:  buf,
 		}
 		select {
 		case s.incoming <- pkt:
 		case <-s.closeCh:
+			s.readPool.Put(buf)
 			return
 		}
 	}
@@ -387,11 +401,16 @@ func (s *Server) tickLoop() {
 }
 
 func (s *Server) tick() {
+	now := time.Now()
+
 	// Drain incoming packets.
 	for {
 		select {
 		case pkt := <-s.incoming:
 			s.processIncoming(pkt)
+			if pkt.buf != nil {
+				s.readPool.Put(pkt.buf)
+			}
 		default:
 			goto doneIncoming
 		}
@@ -404,7 +423,7 @@ doneIncoming:
 		conns = append(conns, conn)
 	})
 	for _, conn := range conns {
-		s.tickConnection(conn)
+		s.tickConnection(conn, now)
 	}
 
 	// Cleanup expired pending handshakes.
@@ -598,6 +617,8 @@ func (s *Server) processPacket(conn *Connection, data []byte) {
 		case ControlHeartbeat:
 			return
 		case ControlDisconnect:
+			conn.releasePendingBuffers()
+	
 			conn.setState(StateDisconnected)
 			s.conns.remove(conn.remoteAddr)
 			if conn.features&byte(FeatureConnectionMigration) != 0 {
@@ -652,7 +673,7 @@ func (s *Server) processPacket(conn *Connection, data []byte) {
 }
 
 // tickConnection runs per-connection tick logic.
-func (s *Server) tickConnection(conn *Connection) {
+func (s *Server) tickConnection(conn *Connection, now time.Time) {
 	state := conn.State()
 
 	// Handle disconnect retry.
@@ -666,6 +687,8 @@ func (s *Server) tickConnection(conn *Connection) {
 
 		if retries >= maxDisconnectRetries {
 			// Max retries reached — force close.
+			conn.releasePendingBuffers()
+	
 			conn.setState(StateDisconnected)
 			s.conns.remove(conn.remoteAddr)
 			if conn.features&byte(FeatureConnectionMigration) != 0 {
@@ -675,11 +698,11 @@ func (s *Server) tickConnection(conn *Connection) {
 			return
 		}
 
-		if time.Now().After(nextRetry) && pkt != nil && sf != nil {
+		if now.After(nextRetry) && pkt != nil && sf != nil {
 			_ = sf(pkt)
 			conn.mu.Lock()
 			conn.disconnectRetries++
-			conn.nextDisconnectRetry = time.Now().Add(conn.rttState.RTO())
+			conn.nextDisconnectRetry = now.Add(conn.rttState.RTO())
 			conn.mu.Unlock()
 		}
 		return
@@ -690,7 +713,9 @@ func (s *Server) tickConnection(conn *Connection) {
 	}
 
 	// Timeout check.
-	if conn.isTimedOut(s.config.ConnTimeout) {
+	if conn.isTimedOutAt(now, s.config.ConnTimeout) {
+		conn.releasePendingBuffers()
+
 		conn.setState(StateDisconnected)
 		s.conns.remove(conn.remoteAddr)
 		if conn.features&byte(FeatureConnectionMigration) != 0 {
@@ -706,8 +731,10 @@ func (s *Server) tickConnection(conn *Connection) {
 		rto /= 2
 	}
 	for _, ch := range conn.channels {
-		retransmits, kill := ch.checkRetransmissions(time.Now(), rto, s.config.MaxRetransmits)
+		retransmits, kill := ch.checkRetransmissions(now, rto, s.config.MaxRetransmits)
 		if kill {
+			conn.releasePendingBuffers()
+	
 			conn.setState(StateDisconnected)
 			s.conns.remove(conn.remoteAddr)
 			if conn.features&byte(FeatureConnectionMigration) != 0 {
@@ -718,12 +745,15 @@ func (s *Server) tickConnection(conn *Connection) {
 			return
 		}
 		for _, p := range retransmits {
-			encrypted, err := fwcrypto.Encrypt(conn.sendCipher, p.raw, nil)
+			encBuf := getSendBuffer(fwcrypto.NonceSize + len(p.raw) + fwcrypto.TagSize)
+			encrypted, err := fwcrypto.Encrypt(conn.sendCipher, p.raw, encBuf)
 			if err != nil {
+				putSendBuffer(encBuf)
 				continue
 			}
 			_ = conn.sendFramed(encrypted)
-			conn.touchSend()
+			putSendBuffer(encrypted[:cap(encrypted)])
+			conn.lastSendNano.Store(now.UnixNano())
 			conn.cc.OnLoss()
 		}
 	}
@@ -735,7 +765,7 @@ func (s *Server) tickConnection(conn *Connection) {
 			conn.requeue(msgs[i:])
 			break
 		}
-		if err := conn.sendMessage(msg.data, msg.channel); err != nil {
+		if err := conn.sendMessage(msg.data, msg.channel, now); err != nil {
 			s.handler.OnError(conn, err)
 		}
 	}
@@ -755,7 +785,7 @@ func (s *Server) tickConnection(conn *Connection) {
 	}
 
 	// Heartbeat.
-	if conn.needsHeartbeat(s.config.HeartbeatInterval) {
+	if conn.needsHeartbeatAt(now, s.config.HeartbeatInterval) {
 		_ = conn.sendHeartbeat()
 	}
 

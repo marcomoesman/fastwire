@@ -15,6 +15,7 @@
 | 9 | API Surface, Callbacks & Polish | Done |
 | 10 | Testing, Benchmarks & Documentation | Done |
 | 11 | Send Batching, Migration, Coalescing & Bandwidth | Done |
+| 12 | Performance Optimization | Done |
 
 ## Phase Completion Process
 
@@ -24,4 +25,4 @@ Each phase produces a `phase-*.md` file with:
 
 ## All Phases Complete
 
-All 11 phases are done. See `progress/next.md` for future work ideas.
+All 12 phases are done. See `progress/next.md` for future work ideas.

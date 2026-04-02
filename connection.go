@@ -98,8 +98,8 @@ type Connection struct {
 
 	fragmentID atomic.Uint32 // used as uint16, wrapping
 
-	lastSendTime time.Time
-	lastRecvTime time.Time
+	lastSendNano atomic.Int64 // UnixNano timestamp, lock-free
+	lastRecvNano atomic.Int64 // UnixNano timestamp, lock-free
 	createdAt    time.Time
 
 	sendQueue []outgoingMessage
@@ -132,7 +132,7 @@ type Connection struct {
 func newConnection(addr netip.AddrPort, sendCipher, recvCipher *fwcrypto.CipherState, suite CipherSuite, layout ChannelLayout, compression CompressionConfig, congestionMode CongestionMode, initialCwnd int, features byte, token MigrationToken) *Connection {
 	now := time.Now()
 	cp, _ := newCompressorPool(compression)
-	return &Connection{
+	conn := &Connection{
 		state:          StateConnected,
 		remoteAddr:     addr,
 		sendCipher:     sendCipher,
@@ -144,8 +144,6 @@ func newConnection(addr netip.AddrPort, sendCipher, recvCipher *fwcrypto.CipherS
 		reassembly:     newReassemblyStore(),
 		compress:       cp,
 		cc:             congestion.NewController(congestionMode, initialCwnd),
-		lastSendTime:   now,
-		lastRecvTime:   now,
 		createdAt:      now,
 		loss:           stats.NewLossTracker(),
 		sendBW:         bandwidth.New(),
@@ -154,6 +152,9 @@ func newConnection(addr netip.AddrPort, sendCipher, recvCipher *fwcrypto.CipherS
 		migrationToken: token,
 		batchEnabled:   features&byte(FeatureSendBatching) != 0,
 	}
+	conn.lastSendNano.Store(now.UnixNano())
+	conn.lastRecvNano.Store(now.UnixNano())
+	return conn
 }
 
 // Send queues data for delivery on the given channel during the next tick.
@@ -193,7 +194,7 @@ func (c *Connection) SendImmediate(data []byte, channel byte) error {
 	// Bypass batch buffer for immediate sends.
 	c.skipBatch.Store(true)
 	defer c.skipBatch.Store(false)
-	return c.sendMessage(data, channel)
+	return c.sendMessage(data, channel, time.Now())
 }
 
 // RTT returns the current smoothed round-trip time.
@@ -230,14 +231,19 @@ func (c *Connection) Close() error {
 
 	// Build and store encrypted disconnect packet for retries.
 	if sf != nil {
-		buf := make([]byte, 64)
+		buf := getSendBuffer(64)
 		var ctrlBuf [1]byte
 		n, err := marshalDisconnect(ctrlBuf[:])
-		if err == nil {
+		if err != nil {
+			putSendBuffer(buf)
+		} else {
 			hdr := &PacketHeader{Flags: FlagControl}
 			pn, err2 := buildControlPacket(buf, hdr, ctrlBuf[:n])
-			if err2 == nil {
+			if err2 != nil {
+				putSendBuffer(buf)
+			} else {
 				encrypted, err3 := fwcrypto.Encrypt(c.sendCipher, buf[:pn], nil)
+				putSendBuffer(buf) // plaintext consumed by Encrypt
 				if err3 == nil {
 					// Wrap in batch frame if needed.
 					pktData := encrypted
@@ -303,34 +309,52 @@ func (c *Connection) setState(s ConnState) {
 }
 
 func (c *Connection) touchSend() {
-	c.mu.Lock()
-	c.lastSendTime = time.Now()
-	c.mu.Unlock()
+	c.lastSendNano.Store(time.Now().UnixNano())
 }
 
 func (c *Connection) touchRecv() {
-	c.mu.Lock()
-	c.lastRecvTime = time.Now()
-	c.mu.Unlock()
+	c.lastRecvNano.Store(time.Now().UnixNano())
 }
 
 // needsHeartbeat reports whether no packet has been sent within the interval.
 func (c *Connection) needsHeartbeat(interval time.Duration) bool {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.state == StateConnected && time.Since(c.lastSendTime) >= interval
+	state := c.state
+	c.mu.Unlock()
+	return state == StateConnected &&
+		time.Duration(time.Now().UnixNano()-c.lastSendNano.Load()) >= interval
 }
 
 // isTimedOut reports whether no packet has been received within the timeout.
 func (c *Connection) isTimedOut(timeout time.Duration) bool {
+	return time.Duration(time.Now().UnixNano()-c.lastRecvNano.Load()) >= timeout
+}
+
+// needsHeartbeatAt is like needsHeartbeat but uses the provided time instead of time.Now().
+func (c *Connection) needsHeartbeatAt(now time.Time, interval time.Duration) bool {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	return time.Since(c.lastRecvTime) >= timeout
+	state := c.state
+	c.mu.Unlock()
+	return state == StateConnected &&
+		time.Duration(now.UnixNano()-c.lastSendNano.Load()) >= interval
+}
+
+// isTimedOutAt is like isTimedOut but uses the provided time instead of time.Now().
+func (c *Connection) isTimedOutAt(now time.Time, timeout time.Duration) bool {
+	return time.Duration(now.UnixNano()-c.lastRecvNano.Load()) >= timeout
 }
 
 // nextFragmentID returns the next fragment ID, wrapping at uint16 max.
 func (c *Connection) nextFragmentID() uint16 {
 	return uint16(c.fragmentID.Add(1))
+}
+
+// releasePendingBuffers returns all pooled send buffers held by pending packets
+// across all channels. Called during connection teardown.
+func (c *Connection) releasePendingBuffers() {
+	for _, ch := range c.channels {
+		ch.releasePendingBuffers()
+	}
 }
 
 // queueMessage adds a message to the send queue (caller holds no lock).
@@ -378,9 +402,7 @@ func (c *Connection) sendFramed(encrypted []byte) error {
 // or sending immediately (wrapped in frame if batching is active).
 func (c *Connection) writeEncrypted(encrypted []byte) error {
 	if c.batchEnabled && !c.skipBatch.Load() {
-		cp := make([]byte, len(encrypted))
-		copy(cp, encrypted)
-		c.batchBuf = append(c.batchBuf, cp)
+		c.batchBuf = append(c.batchBuf, encrypted)
 		return nil
 	}
 	return c.sendFramed(encrypted)
@@ -388,7 +410,13 @@ func (c *Connection) writeEncrypted(encrypted []byte) error {
 
 // sendMessage sends a single message through the full send pipeline:
 // compress -> fragment -> encrypt -> send.
-func (c *Connection) sendMessage(data []byte, channelID byte) error {
+func (c *Connection) sendMessage(data []byte, channelID byte, now ...time.Time) error {
+	var ts time.Time
+	if len(now) > 0 {
+		ts = now[0]
+	} else {
+		ts = time.Now()
+	}
 	ch := c.channel(channelID)
 	if ch == nil {
 		return ErrInvalidChannel
@@ -402,14 +430,14 @@ func (c *Connection) sendMessage(data []byte, channelID byte) error {
 	needsFragment := len(compressed) > MaxFragmentPayload || fragFlags != 0
 
 	if !needsFragment {
-		return c.sendSinglePacket(ch, channelID, compressed)
+		return c.sendSinglePacket(ch, channelID, compressed, ts)
 	}
 
-	return c.sendFragmented(ch, channelID, compressed, fragFlags)
+	return c.sendFragmented(ch, channelID, compressed, fragFlags, ts)
 }
 
 // sendSinglePacket sends a non-fragmented packet.
-func (c *Connection) sendSinglePacket(ch *channel, channelID byte, payload []byte) error {
+func (c *Connection) sendSinglePacket(ch *channel, channelID byte, payload []byte, now time.Time) error {
 	seq := ch.nextSequence()
 	ack, ackField := ch.ackState()
 
@@ -420,9 +448,10 @@ func (c *Connection) sendSinglePacket(ch *channel, channelID byte, payload []byt
 		AckField: ackField,
 	}
 
-	buf := make([]byte, MaxHeaderSize+len(payload))
+	buf := getSendBuffer(MaxHeaderSize + len(payload))
 	n, err := MarshalHeader(buf, hdr)
 	if err != nil {
+		putSendBuffer(buf)
 		return err
 	}
 	copy(buf[n:], payload)
@@ -430,42 +459,46 @@ func (c *Connection) sendSinglePacket(ch *channel, channelID byte, payload []byt
 
 	encrypted, err := fwcrypto.Encrypt(c.sendCipher, plaintext, nil)
 	if err != nil {
+		putSendBuffer(buf)
 		return err
 	}
 
 	if err := c.writeEncrypted(encrypted); err != nil {
+		putSendBuffer(buf)
 		return err
 	}
 
-	// Queue for retransmission if reliable.
+	// Queue for retransmission if reliable; otherwise return buf to pool.
 	if ch.mode == ReliableOrdered || ch.mode == ReliableUnordered {
-		now := time.Now()
 		rto := c.rttState.RTO()
 		if c.cc.HalvesRTO() {
 			rto /= 2
 		}
-		raw := make([]byte, len(plaintext))
-		copy(raw, plaintext)
 		ch.addPending(pendingPacket{
-			raw:            raw,
+			raw:            plaintext,
+			poolBuf:        buf[:cap(buf)],
 			sendTime:       now,
 			firstTransmit:  true,
 			sequence:       seq,
 			nextRetransmit: now.Add(rto),
 		})
 		c.loss.RecordSend(seq)
+	} else {
+		putSendBuffer(buf)
 	}
 
-	c.touchSend()
+	c.lastSendNano.Store(now.UnixNano())
 	return nil
 }
 
 // sendFragmented splits a message into fragments and sends each.
-func (c *Connection) sendFragmented(ch *channel, channelID byte, compressed []byte, fragFlags FragmentFlag) error {
+func (c *Connection) sendFragmented(ch *channel, channelID byte, compressed []byte, fragFlags FragmentFlag, now time.Time) error {
 	fragments, err := splitMessage(compressed, c.nextFragmentID(), fragFlags)
 	if err != nil {
 		return err
 	}
+
+	reliable := ch.mode == ReliableOrdered || ch.mode == ReliableUnordered
 
 	for _, frag := range fragments {
 		seq := ch.nextSequence()
@@ -479,9 +512,10 @@ func (c *Connection) sendFragmented(ch *channel, channelID byte, compressed []by
 			AckField: ackField,
 		}
 
-		buf := make([]byte, MaxHeaderSize+len(frag))
+		buf := getSendBuffer(MaxHeaderSize + len(frag))
 		n, err := MarshalHeader(buf, hdr)
 		if err != nil {
+			putSendBuffer(buf)
 			return err
 		}
 		copy(buf[n:], frag)
@@ -489,33 +523,35 @@ func (c *Connection) sendFragmented(ch *channel, channelID byte, compressed []by
 
 		encrypted, err := fwcrypto.Encrypt(c.sendCipher, plaintext, nil)
 		if err != nil {
+			putSendBuffer(buf)
 			return err
 		}
 
 		if err := c.writeEncrypted(encrypted); err != nil {
+			putSendBuffer(buf)
 			return err
 		}
 
-		if ch.mode == ReliableOrdered || ch.mode == ReliableUnordered {
-			now := time.Now()
+		if reliable {
 			rto := c.rttState.RTO()
 			if c.cc.HalvesRTO() {
 				rto /= 2
 			}
-			raw := make([]byte, len(plaintext))
-			copy(raw, plaintext)
 			ch.addPending(pendingPacket{
-				raw:            raw,
+				raw:            plaintext,
+				poolBuf:        buf[:cap(buf)],
 				sendTime:       now,
 				firstTransmit:  true,
 				sequence:       seq,
 				nextRetransmit: now.Add(rto),
 			})
 			c.loss.RecordSend(seq)
+		} else {
+			putSendBuffer(buf)
 		}
 	}
 
-	c.touchSend()
+	c.lastSendNano.Store(now.UnixNano())
 	return nil
 }
 
@@ -546,18 +582,24 @@ func (c *Connection) sendHeartbeatOnChannel(channelID byte) error {
 		AckField: ackField,
 	}
 
-	buf := make([]byte, 64)
+	buf := getSendBuffer(64)
 	pn, err := buildControlPacket(buf, hdr, ctrlBuf[:n])
 	if err != nil {
+		putSendBuffer(buf)
 		return err
 	}
 
-	encrypted, err := fwcrypto.Encrypt(c.sendCipher, buf[:pn], nil)
+	encBuf := getSendBuffer(fwcrypto.NonceSize + pn + fwcrypto.TagSize)
+	encrypted, err := fwcrypto.Encrypt(c.sendCipher, buf[:pn], encBuf)
+	putSendBuffer(buf) // plaintext consumed by Encrypt
 	if err != nil {
+		putSendBuffer(encBuf)
 		return err
 	}
 
-	if err := c.sendFramed(encrypted); err != nil {
+	err = c.sendFramed(encrypted)
+	putSendBuffer(encrypted[:cap(encrypted)])
+	if err != nil {
 		return err
 	}
 	c.touchSend()

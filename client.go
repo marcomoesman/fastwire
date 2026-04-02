@@ -28,6 +28,9 @@ type Client struct {
 	connectErr      error
 	connected       bool
 
+	// Read buffer pool.
+	readPool *sync.Pool
+
 	// Computed client features for handshake.
 	clientFeatures byte
 }
@@ -133,6 +136,8 @@ func (c *Client) Connect(addr string) error {
 	c.connectDoneOnce = sync.Once{}
 	c.connectErr = nil
 
+	c.readPool = newReadPool(c.config.MTU + fwcrypto.WireOverhead + MigrationTokenSize + BatchHeaderSize)
+
 	// Start read loop.
 	c.wg.Add(1)
 	go c.readLoop()
@@ -214,6 +219,8 @@ func (c *Client) Close() error {
 		_ = conn.Close()
 
 		// For client teardown, force state to Disconnected and do full cleanup.
+		conn.releasePendingBuffers()
+
 		conn.setState(StateDisconnected)
 		c.mu.Lock()
 		c.connected = false
@@ -253,9 +260,10 @@ func (c *Client) Connection() *Connection {
 func (c *Client) readLoop() {
 	defer c.wg.Done()
 	for {
-		buf := make([]byte, c.config.MTU+fwcrypto.WireOverhead+MigrationTokenSize+BatchHeaderSize)
+		buf := c.readPool.Get().([]byte)
 		n, err := c.conn.Read(buf)
 		if err != nil {
+			c.readPool.Put(buf)
 			select {
 			case <-c.closeCh:
 				return
@@ -269,18 +277,21 @@ func (c *Client) readLoop() {
 		c.mu.Unlock()
 
 		if !connected {
-			// Still in handshake phase — process inline.
+			// Still in handshake phase — process inline, return buffer immediately.
 			c.processHandshakePacket(buf[:n])
+			c.readPool.Put(buf)
 			continue
 		}
 
 		pkt := incomingPacket{
 			data: buf[:n],
 			n:    n,
+			buf:  buf,
 		}
 		select {
 		case c.incoming <- pkt:
 		case <-c.closeCh:
+			c.readPool.Put(buf)
 			return
 		}
 	}
@@ -354,6 +365,8 @@ func (c *Client) tickLoop() {
 }
 
 func (c *Client) tick() {
+	now := time.Now()
+
 	// Drain incoming packets.
 	for {
 		select {
@@ -363,6 +376,9 @@ func (c *Client) tick() {
 			c.mu.Unlock()
 			if conn != nil {
 				c.processConnData(conn, pkt.data)
+			}
+			if pkt.buf != nil {
+				c.readPool.Put(pkt.buf)
 			}
 		default:
 			goto doneIncoming
@@ -374,7 +390,7 @@ doneIncoming:
 	conn := c.server
 	c.mu.Unlock()
 	if conn != nil {
-		c.tickConnection(conn)
+		c.tickConnection(conn, now)
 	}
 }
 
@@ -439,6 +455,8 @@ func (c *Client) processPacket(conn *Connection, data []byte) {
 		case ControlHeartbeat:
 			return
 		case ControlDisconnect:
+			conn.releasePendingBuffers()
+	
 			conn.setState(StateDisconnected)
 			c.mu.Lock()
 			c.connected = false
@@ -493,7 +511,7 @@ func (c *Client) processPacket(conn *Connection, data []byte) {
 }
 
 // tickConnection runs per-connection tick logic.
-func (c *Client) tickConnection(conn *Connection) {
+func (c *Client) tickConnection(conn *Connection, now time.Time) {
 	state := conn.State()
 
 	// Handle disconnect retry.
@@ -507,6 +525,8 @@ func (c *Client) tickConnection(conn *Connection) {
 
 		if retries >= maxDisconnectRetries {
 			// Max retries reached — force close.
+			conn.releasePendingBuffers()
+	
 			conn.setState(StateDisconnected)
 			c.mu.Lock()
 			c.connected = false
@@ -516,11 +536,11 @@ func (c *Client) tickConnection(conn *Connection) {
 			return
 		}
 
-		if time.Now().After(nextRetry) && pkt != nil && sf != nil {
+		if now.After(nextRetry) && pkt != nil && sf != nil {
 			_ = sf(pkt)
 			conn.mu.Lock()
 			conn.disconnectRetries++
-			conn.nextDisconnectRetry = time.Now().Add(conn.rttState.RTO())
+			conn.nextDisconnectRetry = now.Add(conn.rttState.RTO())
 			conn.mu.Unlock()
 		}
 		return
@@ -531,7 +551,9 @@ func (c *Client) tickConnection(conn *Connection) {
 	}
 
 	// Timeout check.
-	if conn.isTimedOut(c.config.ConnTimeout) {
+	if conn.isTimedOutAt(now, c.config.ConnTimeout) {
+		conn.releasePendingBuffers()
+
 		conn.setState(StateDisconnected)
 		c.mu.Lock()
 		c.connected = false
@@ -547,8 +569,10 @@ func (c *Client) tickConnection(conn *Connection) {
 		rto /= 2
 	}
 	for _, ch := range conn.channels {
-		retransmits, kill := ch.checkRetransmissions(time.Now(), rto, c.config.MaxRetransmits)
+		retransmits, kill := ch.checkRetransmissions(now, rto, c.config.MaxRetransmits)
 		if kill {
+			conn.releasePendingBuffers()
+	
 			conn.setState(StateDisconnected)
 			c.mu.Lock()
 			c.connected = false
@@ -559,12 +583,15 @@ func (c *Client) tickConnection(conn *Connection) {
 			return
 		}
 		for _, p := range retransmits {
-			encrypted, err := fwcrypto.Encrypt(conn.sendCipher, p.raw, nil)
+			encBuf := getSendBuffer(fwcrypto.NonceSize + len(p.raw) + fwcrypto.TagSize)
+			encrypted, err := fwcrypto.Encrypt(conn.sendCipher, p.raw, encBuf)
 			if err != nil {
+				putSendBuffer(encBuf)
 				continue
 			}
 			_ = conn.sendFramed(encrypted)
-			conn.touchSend()
+			putSendBuffer(encrypted[:cap(encrypted)])
+			conn.lastSendNano.Store(now.UnixNano())
 			conn.cc.OnLoss()
 		}
 	}
@@ -576,7 +603,7 @@ func (c *Client) tickConnection(conn *Connection) {
 			conn.requeue(msgs[i:])
 			break
 		}
-		if err := conn.sendMessage(msg.data, msg.channel); err != nil {
+		if err := conn.sendMessage(msg.data, msg.channel, now); err != nil {
 			c.handler.OnError(conn, err)
 		}
 	}
@@ -596,7 +623,7 @@ func (c *Client) tickConnection(conn *Connection) {
 	}
 
 	// Heartbeat.
-	if conn.needsHeartbeat(c.config.HeartbeatInterval) {
+	if conn.needsHeartbeatAt(now, c.config.HeartbeatInterval) {
 		_ = conn.sendHeartbeat()
 	}
 

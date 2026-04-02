@@ -302,6 +302,34 @@ func TestProcessAcksZeroAck(t *testing.T) {
 	}
 }
 
+func TestIsAcked(t *testing.T) {
+	tests := []struct {
+		name     string
+		seq      uint32
+		ack      uint32
+		ackField uint32
+		want     bool
+	}{
+		{"exact match", 5, 5, 0, true},
+		{"ack-1 via bitfield", 4, 5, 0x00000001, true},
+		{"ack-1 missing from bitfield", 4, 5, 0x00000000, false},
+		{"ack-32 via bitfield", 1, 33, 0x80000000, true},
+		{"ack-33 too old", 1, 34, 0xFFFFFFFF, false},
+		{"seq > ack", 10, 5, 0xFFFFFFFF, false},
+		{"ack is zero", 1, 0, 0xFFFFFFFF, false},
+		{"full ackField", 3, 5, 0xFFFFFFFF, true},
+		{"seq is zero in bitfield range", 0, 5, 0xFFFFFFFF, true}, // seq 0 never appears in pendingSend; isAcked sees it as ack-5
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isAcked(tt.seq, tt.ack, tt.ackField)
+			if got != tt.want {
+				t.Errorf("isAcked(%d, %d, 0x%08x) = %v, want %v", tt.seq, tt.ack, tt.ackField, got, tt.want)
+			}
+		})
+	}
+}
+
 // --- Retransmission tests ---
 
 func TestRetransmissionScheduling(t *testing.T) {
@@ -442,6 +470,86 @@ func TestChannelLayoutBuilderMax(t *testing.T) {
 	if layout.Len() != 256 {
 		t.Fatalf("layout len = %d, want 256", layout.Len())
 	}
+}
+
+// --- Pool buffer return tests ---
+
+func TestProcessAcksReturnsPoolBuf(t *testing.T) {
+	ch := &channel{mode: ReliableOrdered, recvBuffer: make(map[uint32][]byte), recvNextDeliver: 1}
+
+	// Get a pool buffer and use it as poolBuf.
+	buf := getSendBuffer(200)
+	now := time.Now()
+	ch.addPending(pendingPacket{
+		raw:            buf[:100],
+		poolBuf:        buf[:cap(buf)],
+		sendTime:       now.Add(-50 * time.Millisecond),
+		firstTransmit:  true,
+		sequence:       1,
+		nextRetransmit: now.Add(time.Second),
+	})
+
+	acked := ch.processAcks(1, 0, nil)
+	if len(acked) != 1 {
+		t.Fatalf("expected 1 acked, got %d", len(acked))
+	}
+	// poolBuf was returned to pool inside processAcks. Verify pool has a buffer.
+	buf2 := getSendBuffer(200)
+	if cap(buf2) < DefaultMTU {
+		t.Fatalf("expected pooled buffer back, got cap %d", cap(buf2))
+	}
+	putSendBuffer(buf2)
+}
+
+func TestProcessAcksNilPoolBuf(t *testing.T) {
+	ch := &channel{mode: ReliableOrdered, recvBuffer: make(map[uint32][]byte), recvNextDeliver: 1}
+
+	now := time.Now()
+	ch.addPending(pendingPacket{
+		raw:            []byte("data"),
+		poolBuf:        nil, // not pooled
+		sendTime:       now.Add(-50 * time.Millisecond),
+		firstTransmit:  true,
+		sequence:       1,
+		nextRetransmit: now.Add(time.Second),
+	})
+
+	// Should not panic with nil poolBuf.
+	acked := ch.processAcks(1, 0, nil)
+	if len(acked) != 1 {
+		t.Fatalf("expected 1 acked, got %d", len(acked))
+	}
+}
+
+func TestReleasePendingBuffers(t *testing.T) {
+	ch := &channel{mode: ReliableOrdered, recvBuffer: make(map[uint32][]byte), recvNextDeliver: 1}
+
+	// Add several pending packets with pool buffers.
+	for i := range 5 {
+		buf := getSendBuffer(200)
+		ch.addPending(pendingPacket{
+			raw:            buf[:100],
+			poolBuf:        buf[:cap(buf)],
+			sequence:       uint32(i + 1),
+			nextRetransmit: time.Now().Add(time.Second),
+		})
+	}
+
+	if ch.pendingCount() != 5 {
+		t.Fatalf("pending count = %d, want 5", ch.pendingCount())
+	}
+
+	ch.releasePendingBuffers()
+
+	if ch.pendingCount() != 0 {
+		t.Fatalf("pending count after release = %d, want 0", ch.pendingCount())
+	}
+}
+
+func TestReleasePendingBuffersEmpty(t *testing.T) {
+	ch := &channel{mode: Unreliable, recvNextDeliver: 1}
+	// Should not panic on empty channel.
+	ch.releasePendingBuffers()
 }
 
 // --- newChannels test ---

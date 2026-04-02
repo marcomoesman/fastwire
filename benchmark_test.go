@@ -12,6 +12,8 @@ import (
 
 // BenchmarkFullSendPath exercises the full send pipeline:
 // compress → fragment check → marshal header → encrypt → sendFunc.
+// It simulates realistic ack flow by acking every 32 packets, allowing
+// the buffer pool to recycle send buffers as it would in production.
 func BenchmarkFullSendPath(b *testing.B) {
 	addr := netip.MustParseAddrPort("127.0.0.1:9000")
 	key := make([]byte, 16)
@@ -35,11 +37,21 @@ func BenchmarkFullSendPath(b *testing.B) {
 	// No-op sendFunc.
 	conn.sendFunc = func(data []byte) error { return nil }
 
+	ch := conn.channels[0] // ReliableOrdered
 	payload := []byte(strings.Repeat("send path benchmark ", 25)) // ~500 bytes
 	b.SetBytes(int64(len(payload)))
+	b.ReportAllocs()
 	b.ResetTimer()
+
+	var seq uint32
 	for b.Loop() {
 		_ = conn.sendMessage(payload, 0)
+		seq++
+		// Ack every 32 packets to simulate realistic ack flow and allow
+		// pool buffer recycling (ackField 0xFFFFFFFF acks seq plus prior 32).
+		if seq%32 == 0 {
+			ch.processAcks(seq, 0xFFFFFFFF, nil)
+		}
 	}
 }
 
@@ -95,6 +107,7 @@ func BenchmarkFullRecvPath(b *testing.B) {
 	}
 
 	b.SetBytes(int64(len(plaintext)))
+	b.ReportAllocs()
 	b.ResetTimer()
 	for i := range b.N {
 		decrypted, err := fwcrypto.Decrypt(recvCS, packets[i], nil)
@@ -173,8 +186,9 @@ func BenchmarkServerThroughput(b *testing.B) {
 	}
 
 	msg := []byte("benchmark")
+	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		// All clients queue a message.
 		for _, conn := range conns {
 			_ = conn.Send(msg, 0)

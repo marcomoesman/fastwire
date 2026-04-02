@@ -11,6 +11,7 @@ type LossTracker struct {
 	head     int // next write position
 	count    int // number of entries written (capped at lossWindowSize)
 	ackCount int // number of acked entries in the ring
+	index    map[uint32]int // seq → ring buffer index for O(1) ack lookup
 }
 
 type lossEntry struct {
@@ -19,7 +20,9 @@ type lossEntry struct {
 }
 
 func NewLossTracker() *LossTracker {
-	return &LossTracker{}
+	return &LossTracker{
+		index: make(map[uint32]int, lossWindowSize),
+	}
 }
 
 // RecordSend records a sent reliable packet.
@@ -27,12 +30,20 @@ func (lt *LossTracker) RecordSend(seq uint32) {
 	lt.mu.Lock()
 	defer lt.mu.Unlock()
 
-	// If overwriting an acked entry, adjust ackCount.
-	if lt.count == lossWindowSize && lt.entries[lt.head].acked {
-		lt.ackCount--
+	// If overwriting an existing entry, clean up.
+	if lt.count == lossWindowSize {
+		old := lt.entries[lt.head]
+		if old.acked {
+			lt.ackCount--
+		}
+		// Remove old entry from index only if it still points to this slot.
+		if idx, ok := lt.index[old.seq]; ok && idx == lt.head {
+			delete(lt.index, old.seq)
+		}
 	}
 
 	lt.entries[lt.head] = lossEntry{seq: seq, acked: false}
+	lt.index[seq] = lt.head
 	lt.head = (lt.head + 1) % lossWindowSize
 	if lt.count < lossWindowSize {
 		lt.count++
@@ -44,13 +55,13 @@ func (lt *LossTracker) RecordAck(seq uint32) {
 	lt.mu.Lock()
 	defer lt.mu.Unlock()
 
-	for i := range lt.count {
-		idx := (lt.head - lt.count + i + lossWindowSize) % lossWindowSize
-		if lt.entries[idx].seq == seq && !lt.entries[idx].acked {
-			lt.entries[idx].acked = true
-			lt.ackCount++
-			return
-		}
+	idx, ok := lt.index[seq]
+	if !ok {
+		return
+	}
+	if lt.entries[idx].seq == seq && !lt.entries[idx].acked {
+		lt.entries[idx].acked = true
+		lt.ackCount++
 	}
 }
 

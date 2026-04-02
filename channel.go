@@ -10,7 +10,8 @@ import (
 
 // pendingPacket represents a sent-but-unacked packet queued for retransmission.
 type pendingPacket struct {
-	raw             []byte    // pre-encryption packet bytes
+	raw             []byte    // pre-encryption packet bytes (may alias poolBuf)
+	poolBuf         []byte    // full-capacity buffer to return to pool on ack; nil if not pooled
 	sendTime        time.Time // when first sent (for RTT measurement)
 	retransmitCount int
 	nextRetransmit  time.Time
@@ -137,25 +138,17 @@ func (ch *channel) processAcks(ack, ackField uint32, r *rtt.State) []uint32 {
 	now := time.Now()
 	var acked []uint32
 
-	// Build set of acked sequences.
-	ackedSet := make(map[uint32]bool)
-	ackedSet[ack] = true
-	for i := uint32(0); i < 32; i++ {
-		if ackField&(1<<i) != 0 {
-			if ack > i+1 {
-				ackedSet[ack-i-1] = true
-			}
-		}
-	}
-
 	// Remove acked packets from pendingSend.
 	n := 0
 	for _, p := range ch.pendingSend {
-		if ackedSet[p.sequence] {
+		if isAcked(p.sequence, ack, ackField) {
 			acked = append(acked, p.sequence)
 			// Measure RTT only for first-transmit packets (Karn's algorithm).
 			if p.firstTransmit && r != nil {
 				r.AddSample(now.Sub(p.sendTime))
+			}
+			if p.poolBuf != nil {
+				putSendBuffer(p.poolBuf)
 			}
 		} else {
 			ch.pendingSend[n] = p
@@ -169,6 +162,20 @@ func (ch *channel) processAcks(ack, ackField uint32, r *rtt.State) []uint32 {
 	ch.pendingSend = ch.pendingSend[:n]
 
 	return acked
+}
+
+// isAcked reports whether seq is acknowledged by the given ack and ackField.
+func isAcked(seq, ack, ackField uint32) bool {
+	if seq == ack {
+		return true
+	}
+	if seq < ack {
+		diff := ack - seq
+		if diff <= 32 {
+			return ackField&(1<<(diff-1)) != 0
+		}
+	}
+	return false
 }
 
 // deliver processes an incoming payload according to the channel's delivery mode.
@@ -256,6 +263,19 @@ func (ch *channel) pendingCount() int {
 	ch.mu.Lock()
 	defer ch.mu.Unlock()
 	return len(ch.pendingSend)
+}
+
+// releasePendingBuffers returns all pooled buffers held by pending packets.
+// Called during connection teardown to prevent pool buffer leaks.
+func (ch *channel) releasePendingBuffers() {
+	ch.mu.Lock()
+	defer ch.mu.Unlock()
+	for _, p := range ch.pendingSend {
+		if p.poolBuf != nil {
+			putSendBuffer(p.poolBuf)
+		}
+	}
+	ch.pendingSend = nil
 }
 
 // checkRetransmissions returns packets that need retransmission and a kill flag
