@@ -639,7 +639,7 @@ func (c *Client) tickConnection(conn *Connection, now time.Time) {
 	// Drain send queue.
 	msgs := conn.drainSendQueue()
 	for i, msg := range msgs {
-		if !conn.cc.CanSend(conn.inFlightCount()) {
+		if !conn.cc.CanSend(conn.InFlightCount()) {
 			conn.requeue(msgs[i:])
 			break
 		}

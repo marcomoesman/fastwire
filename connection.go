@@ -284,8 +284,8 @@ func (c *Connection) channel(id byte) *channel {
 	return c.channels[id]
 }
 
-// inFlightCount returns the total number of unacked reliable packets across all channels.
-func (c *Connection) inFlightCount() int {
+// InFlightCount returns the total number of unacked reliable packets across all channels.
+func (c *Connection) InFlightCount() int {
 	count := 0
 	for _, ch := range c.channels {
 		count += ch.pendingCount()
