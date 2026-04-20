@@ -212,7 +212,7 @@ func TestClientVersionMismatch(t *testing.T) {
 		// OK - might timeout if slow. Acceptable.
 		return
 	}
-	cli.Close()
+	_ = cli.Close()
 }
 
 // --- Edge case tests ---

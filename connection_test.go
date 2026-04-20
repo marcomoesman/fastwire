@@ -14,7 +14,7 @@ func TestNewConnection(t *testing.T) {
 	send, _ := fwcrypto.NewCipherState(nil, CipherNone)
 	recv, _ := fwcrypto.NewCipherState(nil, CipherNone)
 
-	conn := newConnection(addr, send, recv, CipherNone, DefaultChannelLayout(), CompressionConfig{}, CongestionConservative, 0, 0, MigrationToken{})
+	conn := newConnection(connectionInput{addr: addr, sendCipher: send, recvCipher: recv, suite: CipherNone, layout: DefaultChannelLayout(), congestionMode: CongestionConservative})
 
 	if conn.State() != StateConnected {
 		t.Fatalf("state = %v, want StateConnected", conn.State())
@@ -28,7 +28,7 @@ func TestConnectionStateTransitions(t *testing.T) {
 	addr := netip.MustParseAddrPort("127.0.0.1:9000")
 	send, _ := fwcrypto.NewCipherState(nil, CipherNone)
 	recv, _ := fwcrypto.NewCipherState(nil, CipherNone)
-	conn := newConnection(addr, send, recv, CipherNone, DefaultChannelLayout(), CompressionConfig{}, CongestionConservative, 0, 0, MigrationToken{})
+	conn := newConnection(connectionInput{addr: addr, sendCipher: send, recvCipher: recv, suite: CipherNone, layout: DefaultChannelLayout(), congestionMode: CongestionConservative})
 
 	// Connected → Disconnecting
 	conn.setState(StateDisconnecting)
@@ -84,7 +84,7 @@ func TestConnectionHeartbeatNeeded(t *testing.T) {
 	addr := netip.MustParseAddrPort("127.0.0.1:9000")
 	send, _ := fwcrypto.NewCipherState(nil, CipherNone)
 	recv, _ := fwcrypto.NewCipherState(nil, CipherNone)
-	conn := newConnection(addr, send, recv, CipherNone, DefaultChannelLayout(), CompressionConfig{}, CongestionConservative, 0, 0, MigrationToken{})
+	conn := newConnection(connectionInput{addr: addr, sendCipher: send, recvCipher: recv, suite: CipherNone, layout: DefaultChannelLayout(), congestionMode: CongestionConservative})
 
 	// Just created — no heartbeat needed with a 1s interval.
 	if conn.needsHeartbeat(1 * time.Second) {
@@ -109,7 +109,7 @@ func TestConnectionHeartbeatOnlyWhenConnected(t *testing.T) {
 	addr := netip.MustParseAddrPort("127.0.0.1:9000")
 	send, _ := fwcrypto.NewCipherState(nil, CipherNone)
 	recv, _ := fwcrypto.NewCipherState(nil, CipherNone)
-	conn := newConnection(addr, send, recv, CipherNone, DefaultChannelLayout(), CompressionConfig{}, CongestionConservative, 0, 0, MigrationToken{})
+	conn := newConnection(connectionInput{addr: addr, sendCipher: send, recvCipher: recv, suite: CipherNone, layout: DefaultChannelLayout(), congestionMode: CongestionConservative})
 
 	conn.lastSendNano.Store(time.Now().Add(-2 * time.Second).UnixNano())
 
@@ -124,7 +124,7 @@ func TestConnectionTimeout(t *testing.T) {
 	addr := netip.MustParseAddrPort("127.0.0.1:9000")
 	send, _ := fwcrypto.NewCipherState(nil, CipherNone)
 	recv, _ := fwcrypto.NewCipherState(nil, CipherNone)
-	conn := newConnection(addr, send, recv, CipherNone, DefaultChannelLayout(), CompressionConfig{}, CongestionConservative, 0, 0, MigrationToken{})
+	conn := newConnection(connectionInput{addr: addr, sendCipher: send, recvCipher: recv, suite: CipherNone, layout: DefaultChannelLayout(), congestionMode: CongestionConservative})
 
 	// Just created — not timed out with a 10s timeout.
 	if conn.isTimedOut(10 * time.Second) {
@@ -151,7 +151,7 @@ func TestDoubleClose(t *testing.T) {
 	addr := netip.MustParseAddrPort("127.0.0.1:9000")
 	send, _ := fwcrypto.NewCipherState(nil, CipherNone)
 	recv, _ := fwcrypto.NewCipherState(nil, CipherNone)
-	conn := newConnection(addr, send, recv, CipherNone, DefaultChannelLayout(), CompressionConfig{}, CongestionConservative, 0, 0, MigrationToken{})
+	conn := newConnection(connectionInput{addr: addr, sendCipher: send, recvCipher: recv, suite: CipherNone, layout: DefaultChannelLayout(), congestionMode: CongestionConservative})
 	conn.sendFunc = func(data []byte) error { return nil }
 
 	// First close should succeed.
@@ -168,7 +168,7 @@ func TestSendOnClosedConnection(t *testing.T) {
 	addr := netip.MustParseAddrPort("127.0.0.1:9000")
 	send, _ := fwcrypto.NewCipherState(nil, CipherNone)
 	recv, _ := fwcrypto.NewCipherState(nil, CipherNone)
-	conn := newConnection(addr, send, recv, CipherNone, DefaultChannelLayout(), CompressionConfig{}, CongestionConservative, 0, 0, MigrationToken{})
+	conn := newConnection(connectionInput{addr: addr, sendCipher: send, recvCipher: recv, suite: CipherNone, layout: DefaultChannelLayout(), congestionMode: CongestionConservative})
 	conn.sendFunc = func(data []byte) error { return nil }
 
 	if err := conn.Close(); err != nil {
@@ -183,7 +183,7 @@ func TestSendOnInvalidChannel(t *testing.T) {
 	addr := netip.MustParseAddrPort("127.0.0.1:9000")
 	send, _ := fwcrypto.NewCipherState(nil, CipherNone)
 	recv, _ := fwcrypto.NewCipherState(nil, CipherNone)
-	conn := newConnection(addr, send, recv, CipherNone, DefaultChannelLayout(), CompressionConfig{}, CongestionConservative, 0, 0, MigrationToken{})
+	conn := newConnection(connectionInput{addr: addr, sendCipher: send, recvCipher: recv, suite: CipherNone, layout: DefaultChannelLayout(), congestionMode: CongestionConservative})
 
 	// Default layout has 4 channels (0-3). Channel 5 should fail.
 	if err := conn.Send([]byte("hello"), 5); err != ErrInvalidChannel {
@@ -195,7 +195,7 @@ func TestCloseDuringSend(t *testing.T) {
 	addr := netip.MustParseAddrPort("127.0.0.1:9000")
 	send, _ := fwcrypto.NewCipherState(nil, CipherNone)
 	recv, _ := fwcrypto.NewCipherState(nil, CipherNone)
-	conn := newConnection(addr, send, recv, CipherNone, DefaultChannelLayout(), CompressionConfig{}, CongestionConservative, 0, 0, MigrationToken{})
+	conn := newConnection(connectionInput{addr: addr, sendCipher: send, recvCipher: recv, suite: CipherNone, layout: DefaultChannelLayout(), congestionMode: CongestionConservative})
 	conn.sendFunc = func(data []byte) error { return nil }
 
 	var wg sync.WaitGroup
@@ -263,7 +263,7 @@ func TestSendPooledUnreliable(t *testing.T) {
 	addr := netip.MustParseAddrPort("127.0.0.1:9000")
 	send, _ := fwcrypto.NewCipherState(nil, CipherNone)
 	recv, _ := fwcrypto.NewCipherState(nil, CipherNone)
-	conn := newConnection(addr, send, recv, CipherNone, DefaultChannelLayout(), CompressionConfig{}, CongestionConservative, 0, 0, MigrationToken{})
+	conn := newConnection(connectionInput{addr: addr, sendCipher: send, recvCipher: recv, suite: CipherNone, layout: DefaultChannelLayout(), congestionMode: CongestionConservative})
 	conn.sendFunc = func(data []byte) error { return nil }
 
 	// Channel 2 is Unreliable — buffer should be returned immediately.
@@ -281,7 +281,7 @@ func TestSendPooledReliable(t *testing.T) {
 	addr := netip.MustParseAddrPort("127.0.0.1:9000")
 	send, _ := fwcrypto.NewCipherState(nil, CipherNone)
 	recv, _ := fwcrypto.NewCipherState(nil, CipherNone)
-	conn := newConnection(addr, send, recv, CipherNone, DefaultChannelLayout(), CompressionConfig{}, CongestionConservative, 0, 0, MigrationToken{})
+	conn := newConnection(connectionInput{addr: addr, sendCipher: send, recvCipher: recv, suite: CipherNone, layout: DefaultChannelLayout(), congestionMode: CongestionConservative})
 	conn.sendFunc = func(data []byte) error { return nil }
 
 	// Channel 0 is ReliableOrdered — buffer should be stored in pendingPacket.
@@ -311,7 +311,7 @@ func TestSendPooledReliableAcked(t *testing.T) {
 	addr := netip.MustParseAddrPort("127.0.0.1:9000")
 	send, _ := fwcrypto.NewCipherState(nil, CipherNone)
 	recv, _ := fwcrypto.NewCipherState(nil, CipherNone)
-	conn := newConnection(addr, send, recv, CipherNone, DefaultChannelLayout(), CompressionConfig{}, CongestionConservative, 0, 0, MigrationToken{})
+	conn := newConnection(connectionInput{addr: addr, sendCipher: send, recvCipher: recv, suite: CipherNone, layout: DefaultChannelLayout(), congestionMode: CongestionConservative})
 	conn.sendFunc = func(data []byte) error { return nil }
 
 	// Send a reliable message.
@@ -339,7 +339,7 @@ func TestReleasePendingBuffersConnection(t *testing.T) {
 	addr := netip.MustParseAddrPort("127.0.0.1:9000")
 	send, _ := fwcrypto.NewCipherState(nil, CipherNone)
 	recv, _ := fwcrypto.NewCipherState(nil, CipherNone)
-	conn := newConnection(addr, send, recv, CipherNone, DefaultChannelLayout(), CompressionConfig{}, CongestionConservative, 0, 0, MigrationToken{})
+	conn := newConnection(connectionInput{addr: addr, sendCipher: send, recvCipher: recv, suite: CipherNone, layout: DefaultChannelLayout(), congestionMode: CongestionConservative})
 	conn.sendFunc = func(data []byte) error { return nil }
 
 	// Send messages on both reliable channels.
@@ -369,7 +369,7 @@ func TestNextFragmentIDWraps(t *testing.T) {
 	addr := netip.MustParseAddrPort("127.0.0.1:9000")
 	send, _ := fwcrypto.NewCipherState(nil, CipherNone)
 	recv, _ := fwcrypto.NewCipherState(nil, CipherNone)
-	conn := newConnection(addr, send, recv, CipherNone, DefaultChannelLayout(), CompressionConfig{}, CongestionConservative, 0, 0, MigrationToken{})
+	conn := newConnection(connectionInput{addr: addr, sendCipher: send, recvCipher: recv, suite: CipherNone, layout: DefaultChannelLayout(), congestionMode: CongestionConservative})
 
 	// First ID should be 1.
 	id := conn.nextFragmentID()

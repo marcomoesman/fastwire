@@ -2,6 +2,7 @@ package fastwire
 
 import (
 	"bytes"
+	"net"
 	"strings"
 	"testing"
 	"time"
@@ -34,15 +35,12 @@ func TestSendBatchingRoundTrip(t *testing.T) {
 		}
 	}
 
-	// Wait for all messages.
+	// Wait for all messages. Messages may arrive out-of-order relative to the
+	// fixed expected payload here (batching can coalesce), so we only assert
+	// that the right count arrives.
 	for i := range 5 {
 		select {
-		case ev := <-srvHandler.messageCh:
-			expected := strings.Repeat("B", i+10)
-			if string(ev.data) != expected {
-				// Messages may arrive in order on reliable ordered channel.
-				// Just check we got the right number.
-			}
+		case <-srvHandler.messageCh:
 		case <-time.After(3 * time.Second):
 			t.Fatalf("timed out waiting for message %d", i)
 		}
@@ -322,6 +320,74 @@ func TestConnectionMigrationNotNegotiatedWhenDisabled(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out")
+	}
+}
+
+// --- Migration Authentication ---
+
+// TestConnectionMigrationHijackRejected verifies that a forged packet prefixed
+// with a known migration token does not re-route the connection's address.
+// The migration token travels in cleartext, so a passive observer knowing it
+// must not be able to hijack the session by sending garbage from a new source.
+func TestConnectionMigrationHijackRejected(t *testing.T) {
+	srvConfig := DefaultServerConfig()
+	srvConfig.ConnectionMigration = true
+	srvHandler := newTestHandler()
+	srv := startTestServer(t, srvConfig, srvHandler)
+
+	cliConfig := DefaultClientConfig()
+	cliConfig.ConnectionMigration = true
+	cli := connectTestClient(t, cliConfig, newTestHandler(), srv.Addr().String())
+
+	var srvConn *Connection
+	select {
+	case srvConn = <-srvHandler.connectCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for connect")
+	}
+
+	originalAddr := srvConn.RemoteAddr()
+	token := srvConn.migrationToken
+	if token == (MigrationToken{}) {
+		t.Fatal("migration token not negotiated")
+	}
+
+	// Forge a packet from a different UDP socket: [token][garbage].
+	attacker, err := net.Dial("udp", srv.Addr().String())
+	if err != nil {
+		t.Fatalf("attacker dial: %v", err)
+	}
+	defer func() { _ = attacker.Close() }()
+
+	forged := make([]byte, MigrationTokenSize+128)
+	copy(forged, token[:])
+	for i := MigrationTokenSize; i < len(forged); i++ {
+		forged[i] = byte(i)
+	}
+	if _, err := attacker.Write(forged); err != nil {
+		t.Fatalf("attacker write: %v", err)
+	}
+
+	// Send a legitimate message from the real client. UDP ordering on loopback
+	// is reliable, so this packet reaches the server after the attacker's. Its
+	// arrival at the handler proves the attacker's packet was already processed
+	// — if migration auth were broken, the address swap would have happened
+	// before this message arrived.
+	if err := cli.Connection().Send([]byte("still-alive"), 0); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	select {
+	case ev := <-srvHandler.messageCh:
+		if string(ev.data) != "still-alive" {
+			t.Fatalf("message = %q", ev.data)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for post-forgery message")
+	}
+
+	// Hijack check: the address must still point at the legitimate client.
+	if got := srvConn.RemoteAddr(); got != originalAddr {
+		t.Fatalf("address hijacked: remote = %v, want %v", got, originalAddr)
 	}
 }
 

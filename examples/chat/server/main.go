@@ -44,7 +44,7 @@ func (s *ChatServer) OnMessage(conn *fastwire.Connection, data []byte, channel b
 		s.conns[conn] = newNick
 		s.mu.Unlock()
 		log.Printf("rename: %s → %s", oldNick, newNick)
-		conn.Send([]byte(fmt.Sprintf("* You are now known as %s", newNick)), 0)
+		_ = conn.Send([]byte(fmt.Sprintf("* You are now known as %s", newNick)), 0)
 		s.broadcast(conn, fmt.Sprintf("* %s is now known as %s", oldNick, newNick))
 		return
 	}
@@ -64,7 +64,7 @@ func (s *ChatServer) broadcast(sender *fastwire.Connection, msg string) {
 	defer s.mu.RUnlock()
 	for conn := range s.conns {
 		if conn != sender {
-			conn.Send(data, 0)
+			_ = conn.Send(data, 0)
 		}
 	}
 }
@@ -83,7 +83,7 @@ func main() {
 	if err := srv.Start(); err != nil {
 		log.Fatal(err)
 	}
-	defer srv.Stop()
+	defer func() { _ = srv.Stop() }()
 
 	fmt.Printf("Chat server listening on %s\n", srv.Addr())
 

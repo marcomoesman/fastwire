@@ -62,6 +62,7 @@ type pendingHandshake struct {
 	layout            ChannelLayout
 	congestionMode    CongestionMode
 	initialCwnd       int
+	settings          connSettings
 	features          byte
 	migrationToken    MigrationToken
 	createdAt         time.Time
@@ -75,15 +76,14 @@ func (ph *pendingHandshake) isExpired(timeout time.Duration) bool {
 // These are sizes of the control payload INCLUDING the ControlType byte.
 
 const (
-	connectMinSize          = 1 + 1 + 2 + 32 + 1 + 1 + 1 + 1 // 40 (added features byte)
-	connectWithDictSize     = connectMinSize + 32              // 72
-	challengeMinSize        = 1 + 1 + 2 + 32 + 32 + 1 + 1 + 1 // 71 (added features byte)
-	challengeWithMigration  = challengeMinSize + 8             // 79 (added migration token)
-	responseSize            = 1 + 32                            // 33
-	versionMismatchSize     = 1 + 1 + 2                         // 4
-	rejectSize              = 1 + 1                              // 2
-	heartbeatSize           = 1                                  // 1
-	disconnectPaySize       = 1                                  // 1
+	connectMinSize         = 1 + 1 + 2 + 32 + 1 + 1 + 1 + 1  // 40 (added features byte)
+	connectWithDictSize    = connectMinSize + 32             // 72
+	challengeMinSize       = 1 + 1 + 2 + 32 + 32 + 1 + 1 + 1 // 71 (added features byte)
+	challengeWithMigration = challengeMinSize + 8            // 79 (added migration token)
+	responseSize           = 1 + 32                          // 33
+	versionMismatchSize    = 1 + 1 + 2                       // 4
+	rejectSize             = 1 + 1                           // 2
+	disconnectPaySize      = 1                               // 1
 )
 
 // --- Marshal/Unmarshal for control payloads ---
@@ -287,14 +287,6 @@ func unmarshalReject(data []byte) (RejectReason, error) {
 	return RejectReason(data[1]), nil
 }
 
-func marshalHeartbeat(buf []byte) (int, error) {
-	if len(buf) < heartbeatSize {
-		return 0, ErrBufferTooSmall
-	}
-	buf[0] = byte(ControlHeartbeat)
-	return heartbeatSize, nil
-}
-
 // multiAckEntry holds the ACK state for a single channel in a multi-channel ACK packet.
 type multiAckEntry struct {
 	Channel  byte
@@ -465,11 +457,23 @@ func buildRejectPacket(buf []byte, reason RejectReason) (int, error) {
 
 // --- Server-side handshake processing ---
 
+// serverProcessConnectInput groups serverProcessConnect arguments.
+type serverProcessConnectInput struct {
+	data              []byte
+	serverCompression CompressionConfig
+	layout            ChannelLayout
+	congestionMode    CongestionMode
+	initialCwnd       int
+	settings          connSettings
+	serverFeatures    byte
+}
+
 // serverProcessConnect handles an incoming CONNECT packet on the server side.
 // It validates the protocol version, generates a server key pair, creates a challenge
 // token, derives keys, and builds the CHALLENGE response packet.
 // Returns the pending handshake state and the CHALLENGE packet bytes.
-func serverProcessConnect(data []byte, serverCompression CompressionConfig, layout ChannelLayout, congestionMode CongestionMode, initialCwnd int, serverFeatures byte) (*pendingHandshake, []byte, error) {
+func serverProcessConnect(in serverProcessConnectInput) (*pendingHandshake, []byte, error) {
+	data := in.data
 	// Parse the control packet.
 	_, ct, ctrlPayload, err := parseControlPacket(data)
 	if err != nil {
@@ -501,18 +505,18 @@ func serverProcessConnect(data []byte, serverCompression CompressionConfig, layo
 	// Determine compression ack and negotiated config.
 	compAck := compressionOK
 	negotiatedCompression := CompressionConfig{}
-	if connect.Compression != CompressionNone && serverCompression.Algorithm != connect.Compression {
+	if connect.Compression != CompressionNone && in.serverCompression.Algorithm != connect.Compression {
 		compAck = compressionDictMismatch
-	} else if connect.Compression != CompressionNone && serverCompression.Algorithm == connect.Compression {
+	} else if connect.Compression != CompressionNone && in.serverCompression.Algorithm == connect.Compression {
 		// Algorithm matches — check dictionary hash for zstd.
 		if connect.Compression == CompressionZstd && connect.DictHash != nil {
-			serverHash := DictionaryHash(serverCompression.Dictionary)
+			serverHash := DictionaryHash(in.serverCompression.Dictionary)
 			if !bytes.Equal(connect.DictHash, serverHash[:]) {
 				compAck = compressionDictMismatch
 			}
 		}
 		if compAck == compressionOK {
-			negotiatedCompression = serverCompression
+			negotiatedCompression = in.serverCompression
 		}
 	}
 
@@ -541,7 +545,7 @@ func serverProcessConnect(data []byte, serverCompression CompressionConfig, layo
 	}
 
 	// Negotiate features.
-	negotiatedFeatures := connect.Features & serverFeatures
+	negotiatedFeatures := connect.Features & in.serverFeatures
 
 	// Generate migration token if negotiated.
 	var migrationToken MigrationToken
@@ -574,9 +578,10 @@ func serverProcessConnect(data []byte, serverCompression CompressionConfig, layo
 		suite:             selectedCipher,
 		compression:       compAck,
 		compressionConfig: negotiatedCompression,
-		layout:            layout,
-		congestionMode:    congestionMode,
-		initialCwnd:       initialCwnd,
+		layout:            in.layout,
+		congestionMode:    in.congestionMode,
+		initialCwnd:       in.initialCwnd,
+		settings:          in.settings,
 		features:          negotiatedFeatures,
 		migrationToken:    migrationToken,
 		createdAt:         time.Now(),
@@ -686,5 +691,17 @@ func serverProcessResponse(encryptedData []byte, pending *pendingHandshake, addr
 		return nil, err
 	}
 
-	return newConnection(addr, sendCipher, recvCipher, pending.suite, pending.layout, pending.compressionConfig, pending.congestionMode, pending.initialCwnd, pending.features, pending.migrationToken), nil
+	return newConnection(connectionInput{
+		addr:           addr,
+		sendCipher:     sendCipher,
+		recvCipher:     recvCipher,
+		suite:          pending.suite,
+		layout:         pending.layout,
+		compression:    pending.compressionConfig,
+		congestionMode: pending.congestionMode,
+		initialCwnd:    pending.initialCwnd,
+		features:       pending.features,
+		token:          pending.migrationToken,
+		settings:       pending.settings,
+	}), nil
 }

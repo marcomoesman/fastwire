@@ -49,9 +49,35 @@ fastwire/
     └── phase-*.md
 ```
 
-## Key Design Decisions
+## Key Rules and Guidance
 
-**Read the implementation guide before making changes.** It documents critical decisions.
+### General
+- Ask clarifying questions for ambiguous requirements.
+- Don't assume. Don't hide confusion. Surface tradeoffs.
+- Before implementing, state your assumptions explicitly. If uncertain, ask. If multiple interpretations exist, present them - don't pick silently.
+- Ask yourself: "Would a senior engineer say this is overcomplicated?" If yes, simplify.
+- **Read the implementation guide before making changes.** It documents critical decisions.
+
+### Code Style
+- Minimum code that solves the problem. Nothing speculative.
+- No abstractions for single-use code.
+- No error handling for impossible scenarios.
+- Enforce `gofmt`, `go vet`.
+- Small interfaces near consumers; prefer composition over inheritance.
+- Avoid reflection on hot paths; prefer generics when it clarifies and speeds.
+- Use input structs for function receiving more than 2 arguments. Input contexts should not get in the input struct.
+- Declare function input structs before the function consuming them.
+
+### Concurrency
+- The **sender** closes channels; receivers never close.
+- Tie goroutine lifetime to a `context.Context`; prevent leaks.
+- Protect shared state with `sync.Mutex`/`atomic`; no "probably safe" races.
+- Use `errgroup` for fan‑out work; cancel on first error.
+
+### Errors
+- Wrap with `%w` and context: `fmt.Errorf("open %s: %w", p, err)`.
+- Use `errors.Is`/`errors.As` for control flow; no string matching.
+- Define sentinel errors in the package; document behavior.
 
 ## Progress Tracking
 

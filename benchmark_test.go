@@ -42,10 +42,18 @@ func benchmarkSendPath(b *testing.B, cfg benchSendConfig) {
 		b.Fatal(err)
 	}
 
-	conn := newConnection(addr, sendCS, recvCS, cfg.cipher, DefaultChannelLayout(), CompressionConfig{
-		Algorithm: cfg.compression,
-		Hurdle:    DefaultCompressionHurdle,
-	}, CongestionConservative, 0, 0, MigrationToken{})
+	conn := newConnection(connectionInput{
+		addr:       addr,
+		sendCipher: sendCS,
+		recvCipher: recvCS,
+		suite:      cfg.cipher,
+		layout:     DefaultChannelLayout(),
+		compression: CompressionConfig{
+			Algorithm: cfg.compression,
+			Hurdle:    DefaultCompressionHurdle,
+		},
+		congestionMode: CongestionConservative,
+	})
 
 	conn.sendFunc = func(data []byte) error { return nil }
 
@@ -93,10 +101,18 @@ func benchmarkRecvPath(b *testing.B, cfg benchSendConfig) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	sender := newConnection(addr, sendCS, sendRecvCS, cfg.cipher, DefaultChannelLayout(), CompressionConfig{
-		Algorithm: cfg.compression,
-		Hurdle:    DefaultCompressionHurdle,
-	}, CongestionConservative, 0, 0, MigrationToken{})
+	sender := newConnection(connectionInput{
+		addr:       addr,
+		sendCipher: sendCS,
+		recvCipher: sendRecvCS,
+		suite:      cfg.cipher,
+		layout:     DefaultChannelLayout(),
+		compression: CompressionConfig{
+			Algorithm: cfg.compression,
+			Hurdle:    DefaultCompressionHurdle,
+		},
+		congestionMode: CongestionConservative,
+	})
 
 	// Capture encrypted packets from sendFunc.
 	const maxPrealloc = 8192
@@ -125,10 +141,18 @@ func benchmarkRecvPath(b *testing.B, cfg benchSendConfig) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	receiver := newConnection(addr, recvSendCS, recvCS, cfg.cipher, DefaultChannelLayout(), CompressionConfig{
-		Algorithm: cfg.compression,
-		Hurdle:    DefaultCompressionHurdle,
-	}, CongestionConservative, 0, 0, MigrationToken{})
+	receiver := newConnection(connectionInput{
+		addr:       addr,
+		sendCipher: recvSendCS,
+		recvCipher: recvCS,
+		suite:      cfg.cipher,
+		layout:     DefaultChannelLayout(),
+		compression: CompressionConfig{
+			Algorithm: cfg.compression,
+			Hurdle:    DefaultCompressionHurdle,
+		},
+		congestionMode: CongestionConservative,
+	})
 	receiver.setState(StateConnected)
 	receiver.sendFunc = func(data []byte) error { return nil }
 
@@ -152,7 +176,7 @@ func benchmarkRecvPath(b *testing.B, cfg benchSendConfig) {
 				b.Fatal(err)
 			}
 			receiver.recvCipher = recvCS
-			receiver.reassembly = newReassemblyStore(5 * time.Second)
+			receiver.reassembly = newReassemblyStore(reassemblyStoreInput{fragmentTimeout: 5 * time.Second})
 			for _, ch := range receiver.channels {
 				ch.mu.Lock()
 				ch.recvAck = 0
@@ -250,7 +274,7 @@ func BenchmarkServerThroughput(b *testing.B) {
 	if err := srv.Start(); err != nil {
 		b.Fatal(err)
 	}
-	defer srv.Stop()
+	defer func() { _ = srv.Stop() }()
 
 	// Tick the server in the background during client setup so handshakes complete.
 	setupDone := make(chan struct{})
@@ -262,7 +286,7 @@ func BenchmarkServerThroughput(b *testing.B) {
 			case <-setupDone:
 				return
 			case <-ticker.C:
-				srv.Tick()
+				_ = srv.Tick()
 			}
 		}
 	}()
@@ -278,7 +302,7 @@ func BenchmarkServerThroughput(b *testing.B) {
 			b.Fatal(err)
 		}
 		clients[i] = cli
-		defer cli.Close()
+		defer func() { _ = cli.Close() }()
 	}
 
 	// Wait for all connections.
@@ -309,7 +333,7 @@ func BenchmarkServerThroughput(b *testing.B) {
 			_ = conn.Send(msg, 0)
 		}
 		// Server tick processes incoming + outgoing.
-		srv.Tick()
+		_ = srv.Tick()
 	}
 	b.StopTimer()
 }

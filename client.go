@@ -14,8 +14,8 @@ type Client struct {
 	conn    *net.UDPConn
 	handler Handler
 
-	server   *Connection           // single connection to the server
-	clientKP fwcrypto.KeyPair      // stored for handshake processing
+	server   *Connection      // single connection to the server
+	clientKP fwcrypto.KeyPair // stored for handshake processing
 
 	incoming  chan incomingPacket
 	closeCh   chan struct{}
@@ -66,6 +66,15 @@ func NewClient(config ClientConfig, handler Handler) (*Client, error) {
 	if config.InitialCwnd == 0 {
 		config.InitialCwnd = DefaultInitialCwnd
 	}
+	if config.MaxReorderWindow == 0 {
+		config.MaxReorderWindow = DefaultMaxReorderWindow
+	}
+	if config.MaxReassemblyBuffers == 0 {
+		config.MaxReassemblyBuffers = DefaultMaxReassemblyBuffers
+	}
+	if config.MaxReassemblyBytes == 0 {
+		config.MaxReassemblyBytes = DefaultMaxReassemblyBytes
+	}
 
 	cf := featuresFromConfig(config.SendBatching, config.ConnectionMigration)
 
@@ -101,7 +110,7 @@ func (c *Client) Connect(addr string) error {
 	// Generate key pair.
 	kp, err := fwcrypto.GenerateKeyPair()
 	if err != nil {
-		c.conn.Close()
+		_ = c.conn.Close()
 		return err
 	}
 	c.clientKP = kp
@@ -123,11 +132,11 @@ func (c *Client) Connect(addr string) error {
 	buf := make([]byte, 128)
 	n, err := buildConnectPacket(buf, connectPkt)
 	if err != nil {
-		c.conn.Close()
+		_ = c.conn.Close()
 		return err
 	}
 	if _, err := c.conn.Write(buf[:n]); err != nil {
-		c.conn.Close()
+		_ = c.conn.Close()
 		return err
 	}
 
@@ -150,7 +159,7 @@ func (c *Client) Connect(addr string) error {
 		if c.connectErr != nil {
 			c.closeOnce.Do(func() {
 				close(c.closeCh)
-				c.conn.Close()
+				_ = c.conn.Close()
 			})
 			c.wg.Wait()
 			return c.connectErr
@@ -161,7 +170,7 @@ func (c *Client) Connect(addr string) error {
 		c.mu.Unlock()
 		c.closeOnce.Do(func() {
 			close(c.closeCh)
-			c.conn.Close()
+			_ = c.conn.Close()
 		})
 		c.wg.Wait()
 		return ErrHandshakeTimeout
@@ -237,7 +246,7 @@ func (c *Client) Close() error {
 	c.closeOnce.Do(func() {
 		close(c.closeCh)
 		if c.conn != nil {
-			c.conn.Close()
+			_ = c.conn.Close()
 		}
 	})
 	c.wg.Wait()
@@ -269,6 +278,7 @@ func (c *Client) readLoop() {
 		buf := c.readPool.Get().([]byte)
 		n, err := c.conn.Read(buf)
 		if err != nil {
+			//nolint:staticcheck // SA6002: we intentionally store []byte in sync.Pool
 			c.readPool.Put(buf)
 			select {
 			case <-c.closeCh:
@@ -293,6 +303,7 @@ func (c *Client) readLoop() {
 		if !connected {
 			// Still in handshake phase — process inline, return buffer immediately.
 			c.processHandshakePacket(buf[:n])
+			//nolint:staticcheck // SA6002: we intentionally store []byte in sync.Pool
 			c.readPool.Put(buf)
 			continue
 		}
@@ -305,6 +316,7 @@ func (c *Client) readLoop() {
 		select {
 		case c.incoming <- pkt:
 		case <-c.closeCh:
+			//nolint:staticcheck // SA6002: we intentionally store []byte in sync.Pool
 			c.readPool.Put(buf)
 			return
 		}
@@ -353,9 +365,24 @@ func (c *Client) handleChallenge(data []byte) {
 	serverAddr := c.conn.RemoteAddr().(*net.UDPAddr).AddrPort()
 
 	// Create connection with negotiated features.
-	conn := newConnection(serverAddr, sendCipher, recvCipher, suite,
-		c.config.ChannelLayout, c.config.Compression, c.config.Congestion, c.config.InitialCwnd,
-		challenge.Features, challenge.MigrationToken)
+	conn := newConnection(connectionInput{
+		addr:           serverAddr,
+		sendCipher:     sendCipher,
+		recvCipher:     recvCipher,
+		suite:          suite,
+		layout:         c.config.ChannelLayout,
+		compression:    c.config.Compression,
+		congestionMode: c.config.Congestion,
+		initialCwnd:    c.config.InitialCwnd,
+		features:       challenge.Features,
+		token:          challenge.MigrationToken,
+		settings: connSettings{
+			maxReorderWindow:     c.config.MaxReorderWindow,
+			maxReassemblyBuffers: c.config.MaxReassemblyBuffers,
+			maxReassemblyBytes:   c.config.MaxReassemblyBytes,
+			fragmentTimeout:      c.config.FragmentTimeout,
+		},
+	})
 
 	c.mu.Lock()
 	if c.connectAborted {
@@ -396,6 +423,7 @@ func (c *Client) tick() {
 				c.processConnData(conn, pkt.data)
 			}
 			if pkt.buf != nil {
+				//nolint:staticcheck // SA6002: we intentionally store []byte in sync.Pool
 				c.readPool.Put(pkt.buf)
 			}
 		default:
@@ -496,7 +524,7 @@ func (c *Client) processPacket(conn *Connection, data []byte) {
 			return
 		case ControlDisconnect:
 			conn.releasePendingBuffers()
-	
+
 			conn.setState(StateDisconnected)
 			c.mu.Lock()
 			c.connected = false
@@ -566,7 +594,7 @@ func (c *Client) tickConnection(conn *Connection, now time.Time) {
 		if retries >= maxDisconnectRetries {
 			// Max retries reached — force close.
 			conn.releasePendingBuffers()
-	
+
 			conn.setState(StateDisconnected)
 			c.mu.Lock()
 			c.connected = false
@@ -612,7 +640,7 @@ func (c *Client) tickConnection(conn *Connection, now time.Time) {
 		retransmits, kill := ch.checkRetransmissions(now, rto, c.config.MaxRetransmits)
 		if kill {
 			conn.releasePendingBuffers()
-	
+
 			conn.setState(StateDisconnected)
 			c.mu.Lock()
 			c.connected = false

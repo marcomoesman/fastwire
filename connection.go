@@ -1,6 +1,7 @@
 package fastwire
 
 import (
+	"cmp"
 	"net/netip"
 	"sync"
 	"sync/atomic"
@@ -85,7 +86,9 @@ const maxBatchQueueSize = 256
 
 // Connection represents a FastWire connection to a remote peer.
 type Connection struct {
-	mu         sync.Mutex
+	mu sync.Mutex
+	// state and remoteAddr are protected by mu. External code must read
+	// remoteAddr via RemoteAddr() — it changes during migration under mu.
 	state      ConnState
 	remoteAddr netip.AddrPort
 
@@ -128,34 +131,68 @@ type Connection struct {
 
 	// Send batching state.
 	batchEnabled bool
-	batchMu      sync.Mutex  // protects batchBuf
+	batchMu      sync.Mutex // protects batchBuf
 	batchBuf     [][]byte
 	skipBatch    atomic.Bool // true during SendImmediate
 }
 
+// connSettings groups server-side safety caps that are not negotiated during
+// handshake. Zero fields mean "use the package default"; the helpers that
+// consume these values apply those defaults.
+type connSettings struct {
+	maxReorderWindow     int
+	maxReassemblyBuffers int
+	maxReassemblyBytes   int
+	fragmentTimeout      time.Duration
+}
+
+// connectionInput groups newConnection arguments to stay under the 2-arg
+// limit for function signatures in this package.
+type connectionInput struct {
+	addr           netip.AddrPort
+	sendCipher     *fwcrypto.CipherState
+	recvCipher     *fwcrypto.CipherState
+	suite          CipherSuite
+	layout         ChannelLayout
+	compression    CompressionConfig
+	congestionMode CongestionMode
+	initialCwnd    int
+	features       byte
+	token          MigrationToken
+	settings       connSettings
+}
+
 // newConnection creates a Connection in StateConnected with the given cipher states.
-func newConnection(addr netip.AddrPort, sendCipher, recvCipher *fwcrypto.CipherState, suite CipherSuite, layout ChannelLayout, compression CompressionConfig, congestionMode CongestionMode, initialCwnd int, features byte, token MigrationToken) *Connection {
+// Zero-valued safety caps (fragment timeout, reassembly caps) default to the
+// package defaults so callers that forget them still get bounded behavior.
+// The reassembly store itself treats zero as unbounded — only this constructor
+// applies defaults.
+func newConnection(in connectionInput) *Connection {
 	now := time.Now()
-	cp, _ := newCompressorPool(compression)
+	cp, _ := newCompressorPool(in.compression)
 	conn := &Connection{
-		state:          StateConnected,
-		remoteAddr:     addr,
-		sendCipher:     sendCipher,
-		recvCipher:     recvCipher,
-		suite:          suite,
-		channels:       newChannels(layout),
-		rttState:       rtt.New(),
-		layout:         layout,
-		reassembly:     newReassemblyStore(DefaultFragmentTimeout),
+		state:      StateConnected,
+		remoteAddr: in.addr,
+		sendCipher: in.sendCipher,
+		recvCipher: in.recvCipher,
+		suite:      in.suite,
+		channels:   newChannels(in.layout, cmp.Or(in.settings.maxReorderWindow, DefaultMaxReorderWindow)),
+		rttState:   rtt.New(),
+		layout:     in.layout,
+		reassembly: newReassemblyStore(reassemblyStoreInput{
+			fragmentTimeout: cmp.Or(in.settings.fragmentTimeout, DefaultFragmentTimeout),
+			maxBuffers:      cmp.Or(in.settings.maxReassemblyBuffers, DefaultMaxReassemblyBuffers),
+			maxBytes:        cmp.Or(in.settings.maxReassemblyBytes, DefaultMaxReassemblyBytes),
+		}),
 		compress:       cp,
-		cc:             congestion.NewController(congestionMode, initialCwnd),
+		cc:             congestion.NewController(in.congestionMode, in.initialCwnd),
 		createdAt:      now,
 		loss:           stats.NewLossTracker(),
 		sendBW:         bandwidth.New(),
 		recvBW:         bandwidth.New(),
-		features:       features,
-		migrationToken: token,
-		batchEnabled:   features&byte(FeatureSendBatching) != 0,
+		features:       in.features,
+		migrationToken: in.token,
+		batchEnabled:   in.features&byte(FeatureSendBatching) != 0,
 	}
 	conn.lastSendNano.Store(now.UnixNano())
 	conn.lastRecvNano.Store(now.UnixNano())
@@ -363,13 +400,6 @@ func (c *Connection) releasePendingBuffers() {
 	c.reassembly.reset()
 }
 
-// queueMessage adds a message to the send queue (caller holds no lock).
-func (c *Connection) queueMessage(data []byte, ch byte) {
-	c.mu.Lock()
-	c.sendQueue = append(c.sendQueue, outgoingMessage{data: data, channel: ch})
-	c.mu.Unlock()
-}
-
 // drainSendQueue returns and clears the current send queue.
 func (c *Connection) drainSendQueue() []outgoingMessage {
 	c.mu.Lock()
@@ -404,20 +434,23 @@ func (c *Connection) sendFramed(encrypted []byte) error {
 	return c.sendFunc(encrypted)
 }
 
-// writeEncrypted sends an encrypted packet, either adding to the batch buffer
-// or sending immediately (wrapped in frame if batching is active).
+// writeEncrypted takes ownership of the encrypted buffer and either queues it
+// in the batch buffer (freed later by flushBatch) or sends it synchronously
+// and returns the buffer to the pool. Callers must not free encrypted after
+// this returns, regardless of error.
 func (c *Connection) writeEncrypted(encrypted []byte) error {
 	if c.batchEnabled && !c.skipBatch.Load() {
 		c.batchMu.Lock()
-		if len(c.batchBuf) >= maxBatchQueueSize {
+		if len(c.batchBuf) < maxBatchQueueSize {
+			c.batchBuf = append(c.batchBuf, encrypted)
 			c.batchMu.Unlock()
-			return c.sendFramed(encrypted)
+			return nil
 		}
-		c.batchBuf = append(c.batchBuf, encrypted)
 		c.batchMu.Unlock()
-		return nil
 	}
-	return c.sendFramed(encrypted)
+	err := c.sendFramed(encrypted)
+	putSendBuffer(encrypted[:cap(encrypted)])
+	return err
 }
 
 // sendMessage sends a single message through the full send pipeline:
@@ -477,8 +510,8 @@ func (c *Connection) sendSinglePacket(ch *channel, channelID byte, payload []byt
 		return err
 	}
 
+	// writeEncrypted takes ownership of encrypted regardless of error.
 	if err := c.writeEncrypted(encrypted); err != nil {
-		putSendBuffer(encBuf)
 		putSendBuffer(buf)
 		return err
 	}
@@ -544,8 +577,8 @@ func (c *Connection) sendFragmented(ch *channel, channelID byte, compressed []by
 			return err
 		}
 
+		// writeEncrypted takes ownership of encrypted regardless of error.
 		if err := c.writeEncrypted(encrypted); err != nil {
-			putSendBuffer(encBuf)
 			putSendBuffer(buf)
 			return err
 		}
@@ -615,52 +648,6 @@ func (c *Connection) sendMultiChannelHeartbeat(channelIDs []byte) error {
 	encBuf := getSendBuffer(fwcrypto.NonceSize + pn + fwcrypto.TagSize)
 	encrypted, err := fwcrypto.Encrypt(c.sendCipher, buf[:pn], encBuf)
 	putSendBuffer(buf)
-	if err != nil {
-		putSendBuffer(encBuf)
-		return err
-	}
-
-	err = c.sendFramed(encrypted)
-	putSendBuffer(encrypted[:cap(encrypted)])
-	if err != nil {
-		return err
-	}
-	c.touchSend()
-	return nil
-}
-
-// sendHeartbeatOnChannel sends a heartbeat control packet carrying the ack state
-// for the specified channel.
-func (c *Connection) sendHeartbeatOnChannel(channelID byte) error {
-	ch := c.channel(channelID)
-	if ch == nil {
-		return ErrInvalidChannel
-	}
-
-	var ctrlBuf [1]byte
-	n, err := marshalHeartbeat(ctrlBuf[:])
-	if err != nil {
-		return err
-	}
-
-	ack, ackField := ch.ackState()
-	hdr := &PacketHeader{
-		Flags:    FlagControl,
-		Channel:  channelID,
-		Ack:      ack,
-		AckField: ackField,
-	}
-
-	buf := getSendBuffer(64)
-	pn, err := buildControlPacket(buf, hdr, ctrlBuf[:n])
-	if err != nil {
-		putSendBuffer(buf)
-		return err
-	}
-
-	encBuf := getSendBuffer(fwcrypto.NonceSize + pn + fwcrypto.TagSize)
-	encrypted, err := fwcrypto.Encrypt(c.sendCipher, buf[:pn], encBuf)
-	putSendBuffer(buf) // plaintext consumed by Encrypt
 	if err != nil {
 		putSendBuffer(encBuf)
 		return err

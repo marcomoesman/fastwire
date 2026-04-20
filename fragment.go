@@ -139,12 +139,24 @@ type reassemblyStore struct {
 	mu              sync.Mutex
 	buffers         map[uint16]*reassemblyBuffer
 	fragmentTimeout time.Duration
+	maxBuffers      int
+	maxBytes        int
+	totalBytes      int
 }
 
-func newReassemblyStore(fragmentTimeout time.Duration) *reassemblyStore {
+// reassemblyStoreInput groups newReassemblyStore arguments.
+type reassemblyStoreInput struct {
+	fragmentTimeout time.Duration
+	maxBuffers      int
+	maxBytes        int
+}
+
+func newReassemblyStore(in reassemblyStoreInput) *reassemblyStore {
 	return &reassemblyStore{
 		buffers:         make(map[uint16]*reassemblyBuffer),
-		fragmentTimeout: fragmentTimeout,
+		fragmentTimeout: in.fragmentTimeout,
+		maxBuffers:      in.maxBuffers,
+		maxBytes:        in.maxBytes,
 	}
 }
 
@@ -163,19 +175,31 @@ func (s *reassemblyStore) addFragment(fh FragmentHeader, payload []byte) (assemb
 	defer s.mu.Unlock()
 
 	buf, exists := s.buffers[fh.FragmentID]
-	if exists {
+	if exists && s.fragmentTimeout > 0 && time.Since(buf.createdAt) >= s.fragmentTimeout {
 		// Evict stale buffer on fragment ID reuse (e.g. after uint16 wrap).
-		if s.fragmentTimeout > 0 && time.Since(buf.createdAt) >= s.fragmentTimeout {
-			delete(s.buffers, fh.FragmentID)
-			exists = false
-		}
+		s.totalBytes -= buf.totalBytes
+		delete(s.buffers, fh.FragmentID)
+		exists = false
 	}
 	if exists {
-		// Validate consistency with existing buffer.
 		if buf.count != int(fh.FragmentCount) || buf.flags != fh.FragmentFlags {
 			return nil, false, ErrInvalidFragmentHeader
 		}
-	} else {
+		if buf.fragments[fh.FragmentIndex] != nil {
+			return nil, false, nil // duplicate — silent skip
+		}
+	}
+
+	// Cap hits are silent drops: this path is attacker-reachable and we do not
+	// want to surface DoS probes via OnError.
+	if !exists && s.maxBuffers > 0 && len(s.buffers) >= s.maxBuffers {
+		return nil, false, nil
+	}
+	if s.maxBytes > 0 && s.totalBytes+len(payload) > s.maxBytes {
+		return nil, false, nil
+	}
+
+	if !exists {
 		buf = &reassemblyBuffer{
 			fragments: make([][]byte, fh.FragmentCount),
 			count:     int(fh.FragmentCount),
@@ -185,17 +209,12 @@ func (s *reassemblyStore) addFragment(fh FragmentHeader, payload []byte) (assemb
 		s.buffers[fh.FragmentID] = buf
 	}
 
-	// Duplicate fragment — silent skip.
-	if buf.fragments[fh.FragmentIndex] != nil {
-		return nil, false, nil
-	}
-
-	// Copy payload so caller can reuse their buffer.
 	data := make([]byte, len(payload))
 	copy(data, payload)
 	buf.fragments[fh.FragmentIndex] = data
 	buf.received++
 	buf.totalBytes += len(payload)
+	s.totalBytes += len(payload)
 
 	if buf.received < buf.count {
 		return nil, false, nil
@@ -207,6 +226,7 @@ func (s *reassemblyStore) addFragment(fh FragmentHeader, payload []byte) (assemb
 	for _, f := range buf.fragments {
 		offset += copy(assembled[offset:], f)
 	}
+	s.totalBytes -= buf.totalBytes
 	delete(s.buffers, fh.FragmentID)
 	return assembled, true, nil
 }
@@ -220,6 +240,7 @@ func (s *reassemblyStore) cleanup(timeout time.Duration) int {
 	now := time.Now()
 	for id, buf := range s.buffers {
 		if now.Sub(buf.createdAt) >= timeout {
+			s.totalBytes -= buf.totalBytes
 			delete(s.buffers, id)
 			removed++
 		}
@@ -232,6 +253,7 @@ func (s *reassemblyStore) reset() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	clear(s.buffers)
+	s.totalBytes = 0
 }
 
 // pending returns the number of incomplete reassembly buffers.
@@ -239,4 +261,11 @@ func (s *reassemblyStore) pending() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.buffers)
+}
+
+// bytes returns the total bytes held across in-progress buffers. Intended for tests.
+func (s *reassemblyStore) bytes() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.totalBytes
 }

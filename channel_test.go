@@ -575,7 +575,7 @@ func TestReleasePendingBuffersClearsRecvBuffer(t *testing.T) {
 
 func TestNewChannels(t *testing.T) {
 	layout := DefaultChannelLayout()
-	chs := newChannels(layout)
+	chs := newChannels(layout, DefaultMaxReorderWindow)
 	if len(chs) != 4 {
 		t.Fatalf("len(channels) = %d, want 4", len(chs))
 	}
@@ -589,5 +589,41 @@ func TestNewChannels(t *testing.T) {
 		if chs[i].recvBuffer != nil {
 			t.Fatalf("channel %d should not have recvBuffer", i)
 		}
+	}
+}
+
+// --- Reorder window bound ---
+
+func TestReliableOrderedReorderWindowCap(t *testing.T) {
+	const window = 8
+	chs := newChannels(DefaultChannelLayout(), window)
+	ch := chs[0] // ReliableOrdered
+
+	// Seq 1 fills recvNextDeliver slot cleanly.
+	if !ch.recordReceive(1) {
+		t.Fatal("seq 1 should be accepted")
+	}
+	ch.deliver(1, []byte("x"))
+
+	// Now next-expected is 2. Accept up to window-1 ahead (seq ≤ 9).
+	if !ch.recordReceive(9) {
+		t.Fatal("seq 9 (window edge) should be accepted")
+	}
+	// Seq 10 is exactly at the window boundary — must be dropped.
+	if ch.recordReceive(10) {
+		t.Fatal("seq 10 (beyond window) should be rejected")
+	}
+	// Far-future sequence also dropped.
+	if ch.recordReceive(10_000) {
+		t.Fatal("far-future seq should be rejected")
+	}
+}
+
+func TestReorderWindowDisabledWhenZero(t *testing.T) {
+	chs := newChannels(DefaultChannelLayout(), 0)
+	ch := chs[0]
+	// With no cap, any seq should land.
+	if !ch.recordReceive(1_000_000) {
+		t.Fatal("seq 1M should be accepted when window is unbounded")
 	}
 }

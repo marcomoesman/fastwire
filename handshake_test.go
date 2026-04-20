@@ -275,7 +275,7 @@ func testFullHandshake(t *testing.T, suite CipherSuite) {
 	}
 
 	// 2. Server processes CONNECT → returns pending + CHALLENGE.
-	pending, challengeBytes, err := serverProcessConnect(connectBuf[:cn], CompressionConfig{}, DefaultChannelLayout(), CongestionConservative, 0, 0)
+	pending, challengeBytes, err := serverProcessConnect(serverProcessConnectInput{data: connectBuf[:cn], layout: DefaultChannelLayout(), congestionMode: CongestionConservative})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -368,7 +368,7 @@ func TestHandshakeVersionMismatch(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, mismatchBytes, err := serverProcessConnect(connectBuf[:cn], CompressionConfig{}, DefaultChannelLayout(), CongestionConservative, 0, 0)
+	_, mismatchBytes, err := serverProcessConnect(serverProcessConnectInput{data: connectBuf[:cn], layout: DefaultChannelLayout(), congestionMode: CongestionConservative})
 	if !errors.Is(err, ErrVersionMismatch) {
 		t.Fatalf("expected ErrVersionMismatch, got %v", err)
 	}
@@ -413,7 +413,7 @@ func TestHandshakeCipherNegotiation(t *testing.T) {
 				Compression:     CompressionNone,
 			})
 
-			pending, _, err := serverProcessConnect(connectBuf[:cn], CompressionConfig{}, DefaultChannelLayout(), CongestionConservative, 0, 0)
+			pending, _, err := serverProcessConnect(serverProcessConnectInput{data: connectBuf[:cn], layout: DefaultChannelLayout(), congestionMode: CongestionConservative})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -451,7 +451,7 @@ func TestHandshakeCompressionOK(t *testing.T) {
 		Compression:     CompressionNone,
 	})
 
-	pending, _, err := serverProcessConnect(connectBuf[:cn], CompressionConfig{Algorithm: CompressionNone}, DefaultChannelLayout(), CongestionConservative, 0, 0)
+	pending, _, err := serverProcessConnect(serverProcessConnectInput{data: connectBuf[:cn], serverCompression: CompressionConfig{Algorithm: CompressionNone}, layout: DefaultChannelLayout(), congestionMode: CongestionConservative})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -473,7 +473,7 @@ func TestHandshakeCompressionDictMismatch(t *testing.T) {
 	})
 
 	// Server has zstd configured — mismatch.
-	pending, _, err := serverProcessConnect(connectBuf[:cn], CompressionConfig{Algorithm: CompressionZstd}, DefaultChannelLayout(), CongestionConservative, 0, 0)
+	pending, _, err := serverProcessConnect(serverProcessConnectInput{data: connectBuf[:cn], serverCompression: CompressionConfig{Algorithm: CompressionZstd}, layout: DefaultChannelLayout(), congestionMode: CongestionConservative})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -515,7 +515,7 @@ func TestServerRejectsTamperedResponse(t *testing.T) {
 		Compression:     CompressionNone,
 	})
 
-	pending, challengeBytes, err := serverProcessConnect(connectBuf[:cn], CompressionConfig{}, DefaultChannelLayout(), CongestionConservative, 0, 0)
+	pending, challengeBytes, err := serverProcessConnect(serverProcessConnectInput{data: connectBuf[:cn], layout: DefaultChannelLayout(), congestionMode: CongestionConservative})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -552,7 +552,7 @@ func TestServerRejectsWrongToken(t *testing.T) {
 		Compression:     CompressionNone,
 	})
 
-	pending, _, err := serverProcessConnect(connectBuf[:cn], CompressionConfig{}, DefaultChannelLayout(), CongestionConservative, 0, 0)
+	pending, _, err := serverProcessConnect(serverProcessConnectInput{data: connectBuf[:cn], layout: DefaultChannelLayout(), congestionMode: CongestionConservative})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -1,10 +1,10 @@
 # Future Work
 
-All 13 implementation phases are complete. Below are potential improvements for future development.
+Phase 14 (security & stability hardening) is complete. The next committed phase is 15.
 
-## Stateless Cookies
+## Next: Phase 15 — Stateless Retry Cookie Handshake
 
-Add a stateless cookie mechanism to the handshake to mitigate connection flooding attacks. The server would issue a cookie in its first response (without allocating state), and the client would echo it back before the server commits resources to the connection.
+Design and checklist live in `progress/phase-15.md`. Bumps `ProtocolVersion` to 2 and replaces the interim pending-table / rate-limit mitigation with a proper cookie round-trip that costs the server zero state for un-cookied CONNECTs.
 
 ## sendmmsg/recvmmsg Batch I/O
 

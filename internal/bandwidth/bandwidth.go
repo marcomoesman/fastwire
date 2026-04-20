@@ -10,11 +10,11 @@ const alpha = 0.2
 
 // Estimator tracks bytes over time and produces a smoothed bytes-per-second estimate.
 type Estimator struct {
-	mu        sync.Mutex
-	bytes     uint64
-	estimate  float64
-	lastTick  time.Time
-	started   bool
+	mu       sync.Mutex
+	bytes    uint64
+	estimate float64
+	lastTick time.Time
+	started  bool
 }
 
 // New creates a new bandwidth estimator.

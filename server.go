@@ -1,6 +1,7 @@
 package fastwire
 
 import (
+	"container/list"
 	"net"
 	"net/netip"
 	"runtime"
@@ -101,11 +102,13 @@ func (ct *connectionTable) forEach(fn func(*Connection)) {
 type pendingTable struct {
 	mu      sync.Mutex
 	pending map[netip.AddrPort]*pendingHandshake
+	maxSize int // zero means unbounded
 }
 
-func newPendingTable() *pendingTable {
+func newPendingTable(maxSize int) *pendingTable {
 	return &pendingTable{
 		pending: make(map[netip.AddrPort]*pendingHandshake),
+		maxSize: maxSize,
 	}
 }
 
@@ -115,10 +118,16 @@ func (pt *pendingTable) get(addr netip.AddrPort) *pendingHandshake {
 	return pt.pending[addr]
 }
 
-func (pt *pendingTable) put(addr netip.AddrPort, ph *pendingHandshake) {
+// put stores ph keyed by addr. Returns false when the table is at capacity —
+// a replacement for an existing addr is always allowed.
+func (pt *pendingTable) put(addr netip.AddrPort, ph *pendingHandshake) bool {
 	pt.mu.Lock()
+	defer pt.mu.Unlock()
+	if _, exists := pt.pending[addr]; !exists && pt.maxSize > 0 && len(pt.pending) >= pt.maxSize {
+		return false
+	}
 	pt.pending[addr] = ph
-	pt.mu.Unlock()
+	return true
 }
 
 func (pt *pendingTable) remove(addr netip.AddrPort) {
@@ -137,6 +146,96 @@ func (pt *pendingTable) cleanup(timeout time.Duration) {
 	}
 }
 
+// --- handshake rate limiter ---
+
+// handshakeEntry is the value stored in the limiter's LRU list.
+// addr is duplicated here so we can evict the list tail without a reverse lookup.
+type handshakeEntry struct {
+	addr   netip.Addr
+	tokens float64
+	last   time.Time
+}
+
+// handshakeLimiter is a per-IP leaky-bucket rate limiter for new handshakes.
+// Bounded by handshakeLimiterMaxEntries to prevent spoofed-source state growth.
+// Entries are held in an LRU list — admission pushes to front, overflow evicts
+// from the tail, giving O(1) admission regardless of map size.
+type handshakeLimiter struct {
+	mu      sync.Mutex
+	entries map[netip.Addr]*list.Element // value: *handshakeEntry
+	order   *list.List                   // MRU at front, LRU at back
+	rate    float64                      // tokens per second
+	burst   float64                      // max tokens
+}
+
+func newHandshakeLimiter(rate, burst float64) *handshakeLimiter {
+	return &handshakeLimiter{
+		entries: make(map[netip.Addr]*list.Element),
+		order:   list.New(),
+		rate:    rate,
+		burst:   burst,
+	}
+}
+
+// allow reports whether a new handshake from addr should be admitted, charging
+// one token on success. Safe for concurrent use.
+func (l *handshakeLimiter) allow(addr netip.Addr, now time.Time) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	var e *handshakeEntry
+	if el, ok := l.entries[addr]; ok {
+		e = el.Value.(*handshakeEntry)
+		elapsed := now.Sub(e.last).Seconds()
+		if elapsed > 0 {
+			e.tokens = min(l.burst, e.tokens+elapsed*l.rate)
+			e.last = now
+		}
+		l.order.MoveToFront(el)
+	} else {
+		if l.order.Len() >= handshakeLimiterMaxEntries {
+			back := l.order.Back()
+			delete(l.entries, back.Value.(*handshakeEntry).addr)
+			l.order.Remove(back)
+		}
+		e = &handshakeEntry{addr: addr, tokens: l.burst, last: now}
+		l.entries[addr] = l.order.PushFront(e)
+	}
+
+	if e.tokens < 1 {
+		return false
+	}
+	e.tokens--
+	return true
+}
+
+// size returns the number of tracked IPs. Intended for tests.
+func (l *handshakeLimiter) size() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.order.Len()
+}
+
+// cleanup drops full-capacity buckets older than age. Walks from the LRU tail
+// and stops at the first non-idle entry, so steady-state cost is proportional
+// to the number of expired buckets rather than the total map size.
+func (l *handshakeLimiter) cleanup(now time.Time, age time.Duration) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for {
+		back := l.order.Back()
+		if back == nil {
+			return
+		}
+		e := back.Value.(*handshakeEntry)
+		if e.tokens < l.burst || now.Sub(e.last) < age {
+			return
+		}
+		delete(l.entries, e.addr)
+		l.order.Remove(back)
+	}
+}
+
 // --- write coalescer ---
 
 type writeRequest struct {
@@ -152,9 +251,10 @@ type Server struct {
 	conn    *net.UDPConn
 	handler Handler
 
-	conns   *connectionTable
-	pending *pendingTable
-	tokens  *tokenTable // migration tokens → connections
+	conns       *connectionTable
+	pending     *pendingTable
+	tokens      *tokenTable // migration tokens → connections
+	handshakeLB *handshakeLimiter
 
 	incoming  chan incomingPacket
 	closeCh   chan struct{}
@@ -216,6 +316,24 @@ func NewServer(addr string, config ServerConfig, handler Handler) (*Server, erro
 	if config.InitialCwnd == 0 {
 		config.InitialCwnd = DefaultInitialCwnd
 	}
+	if config.MaxReorderWindow == 0 {
+		config.MaxReorderWindow = DefaultMaxReorderWindow
+	}
+	if config.MaxReassemblyBuffers == 0 {
+		config.MaxReassemblyBuffers = DefaultMaxReassemblyBuffers
+	}
+	if config.MaxReassemblyBytes == 0 {
+		config.MaxReassemblyBytes = DefaultMaxReassemblyBytes
+	}
+	if config.MaxPendingHandshakes == 0 {
+		config.MaxPendingHandshakes = 4 * config.MaxConnections
+	}
+	if config.HandshakeRateLimit == 0 {
+		config.HandshakeRateLimit = DefaultHandshakeRateLimit
+	}
+	if config.HandshakeBurst == 0 {
+		config.HandshakeBurst = DefaultHandshakeBurst
+	}
 	if config.CoalesceIO && config.CoalesceReaders <= 0 {
 		config.CoalesceReaders = runtime.NumCPU()
 	}
@@ -227,8 +345,9 @@ func NewServer(addr string, config ServerConfig, handler Handler) (*Server, erro
 		conn:           udpConn,
 		handler:        handler,
 		conns:          newConnectionTable(),
-		pending:        newPendingTable(),
+		pending:        newPendingTable(config.MaxPendingHandshakes),
 		tokens:         newTokenTable(),
+		handshakeLB:    newHandshakeLimiter(config.HandshakeRateLimit, config.HandshakeBurst),
 		incoming:       make(chan incomingPacket, 4096),
 		closeCh:        make(chan struct{}),
 		serverFeatures: sf,
@@ -283,7 +402,7 @@ func (s *Server) Stop() error {
 
 	s.closeOnce.Do(func() {
 		close(s.closeCh)
-		s.conn.Close()
+		_ = s.conn.Close()
 	})
 
 	s.wg.Wait()
@@ -339,6 +458,7 @@ func (s *Server) readLoop() {
 		buf := s.readPool.Get().([]byte)
 		n, addr, err := s.conn.ReadFromUDPAddrPort(buf)
 		if err != nil {
+			//nolint:staticcheck // SA6002: we intentionally store []byte in sync.Pool
 			s.readPool.Put(buf)
 			select {
 			case <-s.closeCh:
@@ -364,6 +484,7 @@ func (s *Server) readLoop() {
 		select {
 		case s.incoming <- pkt:
 		case <-s.closeCh:
+			//nolint:staticcheck // SA6002: we intentionally store []byte in sync.Pool
 			s.readPool.Put(buf)
 			return
 		}
@@ -418,6 +539,7 @@ func (s *Server) tick() {
 		case pkt := <-s.incoming:
 			s.processIncoming(pkt)
 			if pkt.buf != nil {
+				//nolint:staticcheck // SA6002: we intentionally store []byte in sync.Pool
 				s.readPool.Put(pkt.buf)
 			}
 		default:
@@ -435,8 +557,9 @@ doneIncoming:
 		s.tickConnection(conn, now)
 	}
 
-	// Cleanup expired pending handshakes.
+	// Cleanup expired pending handshakes and idle rate-limit buckets.
 	s.pending.cleanup(s.config.HandshakeTimeout)
+	s.handshakeLB.cleanup(now, s.config.HandshakeTimeout)
 }
 
 func (s *Server) processIncoming(pkt incomingPacket) {
@@ -464,27 +587,79 @@ func (s *Server) processIncoming(pkt incomingPacket) {
 		return
 	}
 
-	// 3. Connection migration: token lookup.
+	// 3. Connection migration: token lookup. The token travels in cleartext,
+	// so a match alone is not proof of identity — authenticate via AEAD before
+	// committing any state change.
 	if s.config.ConnectionMigration && len(pkt.data) >= MigrationTokenSize {
 		var token MigrationToken
 		copy(token[:], pkt.data[:MigrationTokenSize])
-		conn = s.tokens.get(token)
-		if conn != nil {
-			// Migration detected — update address.
-			oldAddr := conn.RemoteAddr()
-			s.conns.remove(oldAddr)
-			conn.mu.Lock()
-			conn.remoteAddr = pkt.addr
-			conn.mu.Unlock()
-			s.conns.put(pkt.addr, conn)
-			s.setupSendFunc(conn, pkt.addr)
-			s.processConnData(conn, pkt.data)
+		if conn := s.tokens.get(token); conn != nil {
+			s.tryMigration(tryMigrationInput{conn: conn, newAddr: pkt.addr, data: pkt.data})
 			return
 		}
 	}
 
 	// 4. New connection (CONNECT).
 	s.handleHandshake(pkt.addr, pkt.data)
+}
+
+// tryMigrationInput groups tryMigration arguments.
+type tryMigrationInput struct {
+	conn    *Connection
+	newAddr netip.AddrPort
+	data    []byte
+}
+
+// tryMigration authenticates the packet under conn.recvCipher before swapping
+// the connection's address. Silent drop on decryption failure — the legitimate
+// client keeps its existing address binding.
+//
+// Parse errors and decryption failures on this path are deliberately not
+// surfaced via OnError: the path is attacker-reachable (anyone can guess a
+// migration token and spam from any address), and a legitimate client
+// experiencing transient loss will simply retransmit.
+func (s *Server) tryMigration(in tryMigrationInput) {
+	conn := in.conn
+	stripped := in.data[MigrationTokenSize:]
+
+	var packets [][]byte
+	if conn.batchEnabled {
+		ps, err := UnmarshalBatch(stripped)
+		if err != nil || len(ps) == 0 {
+			return
+		}
+		packets = ps
+	} else {
+		packets = [][]byte{stripped}
+	}
+
+	// Authenticate by decrypting the first packet.
+	dstBuf := getDecryptBuffer()
+	defer putDecryptBuffer(dstBuf)
+	decrypted, err := fwcrypto.Decrypt(conn.recvCipher, packets[0], dstBuf)
+	if err != nil {
+		return
+	}
+
+	// Auth passed — atomically swap the address.
+	oldAddr := conn.RemoteAddr()
+	if oldAddr != in.newAddr {
+		s.conns.remove(oldAddr)
+		conn.mu.Lock()
+		conn.remoteAddr = in.newAddr
+		conn.mu.Unlock()
+		s.conns.put(in.newAddr, conn)
+		s.setupSendFunc(conn, in.newAddr)
+	}
+
+	conn.bytesReceived.Add(uint64(len(stripped)))
+	conn.recvBW.Record(uint64(len(stripped)))
+
+	// Deliver the already-decrypted first packet, then process the remainder.
+	s.handleDecrypted(conn, decrypted)
+	for _, pkt := range packets[1:] {
+		s.processPacket(conn, pkt)
+	}
 }
 
 // processConnData handles a raw datagram for an established connection.
@@ -569,6 +744,12 @@ func (s *Server) handleHandshake(addr netip.AddrPort, data []byte) {
 		return
 	}
 
+	// Per-IP rate limit — silent drop so the source address bears the cost of
+	// sending without provoking a response (amplification mitigation).
+	if !s.handshakeLB.allow(addr.Addr(), time.Now()) {
+		return
+	}
+
 	// Check MaxConnections.
 	if s.conns.count() >= s.config.MaxConnections {
 		buf := make([]byte, 64)
@@ -579,7 +760,20 @@ func (s *Server) handleHandshake(addr netip.AddrPort, data []byte) {
 		return
 	}
 
-	ph, challengeData, err := serverProcessConnect(data, s.config.Compression, s.config.ChannelLayout, s.config.Congestion, s.config.InitialCwnd, s.serverFeatures)
+	ph, challengeData, err := serverProcessConnect(serverProcessConnectInput{
+		data:              data,
+		serverCompression: s.config.Compression,
+		layout:            s.config.ChannelLayout,
+		congestionMode:    s.config.Congestion,
+		initialCwnd:       s.config.InitialCwnd,
+		settings: connSettings{
+			maxReorderWindow:     s.config.MaxReorderWindow,
+			maxReassemblyBuffers: s.config.MaxReassemblyBuffers,
+			maxReassemblyBytes:   s.config.MaxReassemblyBytes,
+			fragmentTimeout:      s.config.FragmentTimeout,
+		},
+		serverFeatures: s.serverFeatures,
+	})
 	if err != nil {
 		// If version mismatch, challengeData contains the VERSION_MISMATCH packet.
 		if challengeData != nil {
@@ -588,11 +782,15 @@ func (s *Server) handleHandshake(addr netip.AddrPort, data []byte) {
 		return
 	}
 
-	s.pending.put(addr, ph)
+	// Pending table cap — silent drop (any response would be amplification).
+	if !s.pending.put(addr, ph) {
+		return
+	}
 	_, _ = s.conn.WriteToUDPAddrPort(challengeData, addr)
 }
 
 // processPacket is the receive pipeline for a single encrypted packet.
+// Decrypts into a pooled buffer and dispatches via handleDecrypted.
 func (s *Server) processPacket(conn *Connection, data []byte) {
 	dstBuf := getDecryptBuffer()
 	defer putDecryptBuffer(dstBuf)
@@ -602,7 +800,17 @@ func (s *Server) processPacket(conn *Connection, data []byte) {
 		s.handler.OnError(conn, err)
 		return
 	}
+	s.handleDecrypted(conn, decrypted)
+}
 
+// handleDecrypted runs the post-decryption receive pipeline: ack processing,
+// control dispatch, fragment reassembly, and delivery. decrypted must remain
+// valid until this call returns.
+//
+// Handler callbacks (OnMessage, OnError) may observe a slice that aliases the
+// pooled decrypt buffer. The slice becomes invalid after the callback returns.
+// Handlers that need to retain bytes must copy them.
+func (s *Server) handleDecrypted(conn *Connection, decrypted []byte) {
 	hdr, n, err := UnmarshalHeader(decrypted)
 	if err != nil {
 		s.handler.OnError(conn, err)

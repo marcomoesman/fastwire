@@ -14,7 +14,7 @@ func TestTokenTablePutGet(t *testing.T) {
 	addr := netip.MustParseAddrPort("127.0.0.1:9000")
 	send, _ := fwcrypto.NewCipherState(nil, CipherNone)
 	recv, _ := fwcrypto.NewCipherState(nil, CipherNone)
-	conn := newConnection(addr, send, recv, CipherNone, DefaultChannelLayout(), CompressionConfig{}, CongestionConservative, 0, 0, MigrationToken{})
+	conn := newConnection(connectionInput{addr: addr, sendCipher: send, recvCipher: recv, suite: CipherNone, layout: DefaultChannelLayout(), congestionMode: CongestionConservative})
 
 	tt.put(token, conn)
 
@@ -35,7 +35,7 @@ func TestTokenTableRemove(t *testing.T) {
 	addr := netip.MustParseAddrPort("127.0.0.1:9000")
 	send, _ := fwcrypto.NewCipherState(nil, CipherNone)
 	recv, _ := fwcrypto.NewCipherState(nil, CipherNone)
-	conn := newConnection(addr, send, recv, CipherNone, DefaultChannelLayout(), CompressionConfig{}, CongestionConservative, 0, 0, MigrationToken{})
+	conn := newConnection(connectionInput{addr: addr, sendCipher: send, recvCipher: recv, suite: CipherNone, layout: DefaultChannelLayout(), congestionMode: CongestionConservative})
 
 	tt.put(token, conn)
 	tt.remove(token)

@@ -102,7 +102,7 @@ func startTestServer(t *testing.T, config ServerConfig, handler Handler) *Server
 	if err := srv.Start(); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	t.Cleanup(func() { srv.Stop() })
+	t.Cleanup(func() { _ = srv.Stop() })
 	return srv
 }
 
@@ -116,8 +116,107 @@ func connectTestClient(t *testing.T, config ClientConfig, handler Handler, serve
 	if err := cli.Connect(serverAddr); err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
-	t.Cleanup(func() { cli.Close() })
+	t.Cleanup(func() { _ = cli.Close() })
 	return cli
+}
+
+// --- Handshake hardening ---
+
+func TestPendingTableRespectsCap(t *testing.T) {
+	pt := newPendingTable(2)
+	a := netip.MustParseAddrPort("127.0.0.1:1")
+	b := netip.MustParseAddrPort("127.0.0.1:2")
+	c := netip.MustParseAddrPort("127.0.0.1:3")
+
+	if !pt.put(a, &pendingHandshake{}) {
+		t.Fatal("a should fit")
+	}
+	if !pt.put(b, &pendingHandshake{}) {
+		t.Fatal("b should fit")
+	}
+	if pt.put(c, &pendingHandshake{}) {
+		t.Fatal("c must be rejected — table full")
+	}
+	// Replacement for an existing addr is still allowed.
+	if !pt.put(a, &pendingHandshake{}) {
+		t.Fatal("replacement for a should succeed")
+	}
+}
+
+func TestHandshakeLimiterBasicBurstAndRefill(t *testing.T) {
+	lb := newHandshakeLimiter(1.0, 2.0) // 1/s steady, burst 2
+	addr := netip.MustParseAddr("10.0.0.1")
+	start := time.Unix(0, 0)
+
+	// Burst of 2 allowed.
+	if !lb.allow(addr, start) {
+		t.Fatal("first allow should succeed")
+	}
+	if !lb.allow(addr, start) {
+		t.Fatal("second allow (burst) should succeed")
+	}
+	// Third immediate attempt denied.
+	if lb.allow(addr, start) {
+		t.Fatal("third immediate allow must be denied")
+	}
+	// One second later a single token has refilled.
+	if !lb.allow(addr, start.Add(time.Second)) {
+		t.Fatal("allow after 1s refill should succeed")
+	}
+	if lb.allow(addr, start.Add(time.Second)) {
+		t.Fatal("second allow in same tick should be denied")
+	}
+}
+
+func TestHandshakeLimiterEvictsOldest(t *testing.T) {
+	lb := newHandshakeLimiter(1.0, 1.0)
+	start := time.Unix(0, 0)
+
+	// Seed past the cap — eviction kicks in.
+	for i := range handshakeLimiterMaxEntries + 5 {
+		a := netip.AddrFrom4([4]byte{10, 0, byte(i >> 8), byte(i)})
+		lb.allow(a, start.Add(time.Duration(i)*time.Millisecond))
+	}
+	if size := lb.size(); size > handshakeLimiterMaxEntries {
+		t.Fatalf("bucket count %d exceeds cap %d", size, handshakeLimiterMaxEntries)
+	}
+}
+
+// TestHandshakeLimiterLRUOrdering verifies the tail of the LRU list is evicted
+// first when the map is full. We fill to cap with "old" entries, then admit A,
+// B, C (recent), then D at cap — D must evict the oldest filler, leaving A, B,
+// C, and D all present.
+func TestHandshakeLimiterLRUOrdering(t *testing.T) {
+	lb := newHandshakeLimiter(1.0, 1.0)
+	t0 := time.Unix(0, 0)
+	a := netip.AddrFrom4([4]byte{10, 0, 0, 1})
+	b := netip.AddrFrom4([4]byte{10, 0, 0, 2})
+	c := netip.AddrFrom4([4]byte{10, 0, 0, 3})
+	d := netip.AddrFrom4([4]byte{10, 0, 0, 4})
+
+	// Prime to cap-3 with older, unrelated entries.
+	for i := range handshakeLimiterMaxEntries - 3 {
+		addr := netip.AddrFrom4([4]byte{192, 168, byte(i >> 8), byte(i)})
+		lb.allow(addr, t0)
+	}
+	lb.allow(a, t0.Add(1*time.Millisecond))
+	lb.allow(b, t0.Add(2*time.Millisecond))
+	lb.allow(c, t0.Add(3*time.Millisecond))
+	// Inserting d at cap evicts the LRU tail (an older 192.168.x.x entry),
+	// NOT a, b, or c.
+	lb.allow(d, t0.Add(4*time.Millisecond))
+
+	if lb.size() != handshakeLimiterMaxEntries {
+		t.Fatalf("size = %d, want %d", lb.size(), handshakeLimiterMaxEntries)
+	}
+	for _, want := range []netip.Addr{a, b, c, d} {
+		lb.mu.Lock()
+		_, ok := lb.entries[want]
+		lb.mu.Unlock()
+		if !ok {
+			t.Fatalf("%v should still be present after LRU eviction", want)
+		}
+	}
 }
 
 func TestShardForMatchesFNV(t *testing.T) {
@@ -162,7 +261,7 @@ func TestNewServer(t *testing.T) {
 	if srv.config.TickRate != 100 {
 		t.Errorf("TickRate = %d, want 100", srv.config.TickRate)
 	}
-	srv.conn.Close()
+	_ = srv.conn.Close()
 }
 
 func TestServerStartStop(t *testing.T) {
@@ -179,7 +278,7 @@ func TestServerDoubleStart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
-	defer srv.Stop()
+	defer func() { _ = srv.Stop() }()
 
 	if err := srv.Start(); err != nil {
 		t.Fatalf("first Start: %v", err)
@@ -233,7 +332,7 @@ func TestServerRejectWhenFull(t *testing.T) {
 	}
 	err = cli2.Connect(srv.Addr().String())
 	if err == nil {
-		cli2.Close()
+		_ = cli2.Close()
 		t.Fatal("expected second Connect to fail, but succeeded")
 	}
 }

@@ -500,7 +500,7 @@ func TestCompressFragmentReassembleDecompress(t *testing.T) {
 			}
 
 			// Step 3: Reassemble.
-			store := newReassemblyStore(5 * time.Second)
+			store := newReassemblyStore(reassemblyStoreInput{fragmentTimeout: 5 * time.Second})
 			var assembled []byte
 			var complete bool
 			for _, frag := range frags {
@@ -536,10 +536,16 @@ func TestCompressFragmentReassembleDecompress(t *testing.T) {
 
 func TestConnectionHasCompressorPool(t *testing.T) {
 	addr := netip.MustParseAddrPort("127.0.0.1:9999")
-	conn := newConnection(addr, nil, nil, CipherNone, DefaultChannelLayout(), CompressionConfig{
-		Algorithm: CompressionLZ4,
-		Hurdle:    DefaultCompressionHurdle,
-	}, CongestionConservative, 0, 0, MigrationToken{})
+	conn := newConnection(connectionInput{
+		addr:   addr,
+		suite:  CipherNone,
+		layout: DefaultChannelLayout(),
+		compression: CompressionConfig{
+			Algorithm: CompressionLZ4,
+			Hurdle:    DefaultCompressionHurdle,
+		},
+		congestionMode: CongestionConservative,
+	})
 	if conn.compress == nil {
 		t.Fatal("connection should have a compressor pool")
 	}
@@ -547,7 +553,7 @@ func TestConnectionHasCompressorPool(t *testing.T) {
 
 func TestConnectionNoneCompression(t *testing.T) {
 	addr := netip.MustParseAddrPort("127.0.0.1:9999")
-	conn := newConnection(addr, nil, nil, CipherNone, DefaultChannelLayout(), CompressionConfig{}, CongestionConservative, 0, 0, MigrationToken{})
+	conn := newConnection(connectionInput{addr: addr, suite: CipherNone, layout: DefaultChannelLayout(), congestionMode: CongestionConservative})
 	if conn.compress == nil {
 		t.Fatal("connection should have a compressor pool even for CompressionNone")
 	}
@@ -570,10 +576,15 @@ func TestHandshakeDictHashMatch(t *testing.T) {
 		DictHash:        dictHash[:],
 	})
 
-	pending, _, err := serverProcessConnect(connectBuf[:cn], CompressionConfig{
-		Algorithm:  CompressionZstd,
-		Dictionary: dict,
-	}, DefaultChannelLayout(), CongestionConservative, 0, 0)
+	pending, _, err := serverProcessConnect(serverProcessConnectInput{
+		data: connectBuf[:cn],
+		serverCompression: CompressionConfig{
+			Algorithm:  CompressionZstd,
+			Dictionary: dict,
+		},
+		layout:         DefaultChannelLayout(),
+		congestionMode: CongestionConservative,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -601,10 +612,15 @@ func TestHandshakeDictHashMismatch(t *testing.T) {
 	})
 
 	serverDict := []byte("different server dictionary")
-	pending, _, err := serverProcessConnect(connectBuf[:cn], CompressionConfig{
-		Algorithm:  CompressionZstd,
-		Dictionary: serverDict,
-	}, DefaultChannelLayout(), CongestionConservative, 0, 0)
+	pending, _, err := serverProcessConnect(serverProcessConnectInput{
+		data: connectBuf[:cn],
+		serverCompression: CompressionConfig{
+			Algorithm:  CompressionZstd,
+			Dictionary: serverDict,
+		},
+		layout:         DefaultChannelLayout(),
+		congestionMode: CongestionConservative,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

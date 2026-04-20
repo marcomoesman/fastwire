@@ -151,6 +151,31 @@ const (
 
 	// maxRetransmits is the maximum retransmit attempts before killing connection.
 	maxRetransmits = 15
+
+	// DefaultMaxReorderWindow is the default receive window for reliable-ordered
+	// channels, in packets. Sequences further than this beyond the next-expected
+	// delivery slot are dropped (no ack), forcing the sender to retransmit.
+	DefaultMaxReorderWindow = 1024
+
+	// DefaultMaxReassemblyBuffers is the default cap on concurrent fragment
+	// reassembly buffers per connection. Additional fragments beyond this
+	// cap are silently dropped.
+	DefaultMaxReassemblyBuffers = 64
+
+	// DefaultMaxReassemblyBytes is the default cap on total bytes held across
+	// all in-progress reassembly buffers per connection.
+	DefaultMaxReassemblyBytes = 4 * 1024 * 1024
+
+	// DefaultHandshakeRateLimit is the default steady-state rate of new
+	// handshakes accepted per remote IP, in handshakes per second.
+	DefaultHandshakeRateLimit = 10.0
+
+	// DefaultHandshakeBurst is the default token-bucket burst capacity per IP.
+	DefaultHandshakeBurst = 20.0
+
+	// handshakeLimiterMaxEntries caps the per-IP tracking map to prevent
+	// state-exhaustion attacks from many spoofed source addresses.
+	handshakeLimiterMaxEntries = 8192
 )
 
 // ServerConfig holds configuration for a Server.
@@ -169,6 +194,25 @@ type ServerConfig struct {
 	MaxRetransmits    int
 	FragmentTimeout   time.Duration
 	InitialCwnd       int
+	// MaxReorderWindow caps the number of out-of-order packets held for a
+	// reliable-ordered channel. Defaults to DefaultMaxReorderWindow.
+	MaxReorderWindow int
+	// MaxReassemblyBuffers caps concurrent fragment reassembly buffers per
+	// connection. Defaults to DefaultMaxReassemblyBuffers.
+	MaxReassemblyBuffers int
+	// MaxReassemblyBytes caps total bytes held across in-progress reassembly
+	// buffers per connection. Defaults to DefaultMaxReassemblyBytes.
+	MaxReassemblyBytes int
+	// MaxPendingHandshakes caps the number of in-flight handshakes. Additional
+	// CONNECTs are dropped silently until the table drains. Zero defaults to
+	// 4 × MaxConnections.
+	MaxPendingHandshakes int
+	// HandshakeRateLimit caps new-handshake starts per remote IP per second
+	// (leaky bucket). Zero defaults to DefaultHandshakeRateLimit.
+	HandshakeRateLimit float64
+	// HandshakeBurst is the per-IP burst allowance above the steady rate.
+	// Zero defaults to DefaultHandshakeBurst.
+	HandshakeBurst float64
 
 	// SendBatching enables packing multiple encrypted packets per UDP datagram.
 	SendBatching bool
@@ -185,19 +229,22 @@ type ServerConfig struct {
 // DefaultServerConfig returns a ServerConfig with sensible defaults.
 func DefaultServerConfig() ServerConfig {
 	return ServerConfig{
-		MTU:               DefaultMTU,
-		MaxConnections:    1024,
-		TickRate:          100,
-		TickMode:          TickAuto,
-		HeartbeatInterval: 1 * time.Second,
-		ConnTimeout:       10 * time.Second,
-		HandshakeTimeout:  5 * time.Second,
-		ChannelLayout:     DefaultChannelLayout(),
-		Congestion:        CongestionConservative,
-		CipherPreference:  CipherAES128GCM,
-		MaxRetransmits:    maxRetransmits,
-		FragmentTimeout:   DefaultFragmentTimeout,
-		InitialCwnd:       DefaultInitialCwnd,
+		MTU:                  DefaultMTU,
+		MaxConnections:       1024,
+		TickRate:             100,
+		TickMode:             TickAuto,
+		HeartbeatInterval:    1 * time.Second,
+		ConnTimeout:          10 * time.Second,
+		HandshakeTimeout:     5 * time.Second,
+		ChannelLayout:        DefaultChannelLayout(),
+		Congestion:           CongestionConservative,
+		CipherPreference:     CipherAES128GCM,
+		MaxRetransmits:       maxRetransmits,
+		FragmentTimeout:      DefaultFragmentTimeout,
+		InitialCwnd:          DefaultInitialCwnd,
+		MaxReorderWindow:     DefaultMaxReorderWindow,
+		MaxReassemblyBuffers: DefaultMaxReassemblyBuffers,
+		MaxReassemblyBytes:   DefaultMaxReassemblyBytes,
 	}
 }
 
@@ -216,6 +263,15 @@ type ClientConfig struct {
 	MaxRetransmits    int
 	FragmentTimeout   time.Duration
 	InitialCwnd       int
+	// MaxReorderWindow caps the number of out-of-order packets held for a
+	// reliable-ordered channel. Defaults to DefaultMaxReorderWindow.
+	MaxReorderWindow int
+	// MaxReassemblyBuffers caps concurrent fragment reassembly buffers per
+	// connection. Defaults to DefaultMaxReassemblyBuffers.
+	MaxReassemblyBuffers int
+	// MaxReassemblyBytes caps total bytes held across in-progress reassembly
+	// buffers per connection. Defaults to DefaultMaxReassemblyBytes.
+	MaxReassemblyBytes int
 
 	// SendBatching enables packing multiple encrypted packets per UDP datagram.
 	SendBatching bool
@@ -239,17 +295,20 @@ func featuresFromConfig(batching, migration bool) byte {
 // DefaultClientConfig returns a ClientConfig with sensible defaults.
 func DefaultClientConfig() ClientConfig {
 	return ClientConfig{
-		MTU:               DefaultMTU,
-		TickRate:          100,
-		TickMode:          TickAuto,
-		HeartbeatInterval: 1 * time.Second,
-		ConnTimeout:       10 * time.Second,
-		ConnectTimeout:    5 * time.Second,
-		ChannelLayout:     DefaultChannelLayout(),
-		Congestion:        CongestionConservative,
-		CipherPreference:  CipherAES128GCM,
-		MaxRetransmits:    maxRetransmits,
-		FragmentTimeout:   DefaultFragmentTimeout,
-		InitialCwnd:       DefaultInitialCwnd,
+		MTU:                  DefaultMTU,
+		TickRate:             100,
+		TickMode:             TickAuto,
+		HeartbeatInterval:    1 * time.Second,
+		ConnTimeout:          10 * time.Second,
+		ConnectTimeout:       5 * time.Second,
+		ChannelLayout:        DefaultChannelLayout(),
+		Congestion:           CongestionConservative,
+		CipherPreference:     CipherAES128GCM,
+		MaxRetransmits:       maxRetransmits,
+		FragmentTimeout:      DefaultFragmentTimeout,
+		InitialCwnd:          DefaultInitialCwnd,
+		MaxReorderWindow:     DefaultMaxReorderWindow,
+		MaxReassemblyBuffers: DefaultMaxReassemblyBuffers,
+		MaxReassemblyBytes:   DefaultMaxReassemblyBytes,
 	}
 }

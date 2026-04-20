@@ -22,8 +22,9 @@ type pendingPacket struct {
 // channel represents a single logical channel with its own sequence numbers,
 // ack tracking, and delivery mode behavior.
 type channel struct {
-	mode        DeliveryMode
-	streamIndex byte
+	mode             DeliveryMode
+	streamIndex      byte
+	maxReorderWindow uint32 // ReliableOrdered only; 0 means unbounded
 
 	sendSeq atomic.Uint32 // next sequence to assign (starts at 0, first call returns 1)
 
@@ -39,12 +40,18 @@ type channel struct {
 }
 
 // newChannels creates the channel slice from a ChannelLayout.
-func newChannels(layout ChannelLayout) []*channel {
+// maxReorderWindow caps the ordered-channel receive window in packets; 0 means unbounded.
+func newChannels(layout ChannelLayout, maxReorderWindow int) []*channel {
+	w := uint32(0)
+	if maxReorderWindow > 0 {
+		w = uint32(maxReorderWindow)
+	}
 	chs := make([]*channel, len(layout.channels))
 	for i, def := range layout.channels {
 		ch := &channel{
-			mode:        def.Mode,
-			streamIndex: def.StreamIndex,
+			mode:             def.Mode,
+			streamIndex:      def.StreamIndex,
+			maxReorderWindow: w,
 		}
 		if def.Mode == ReliableOrdered {
 			ch.recvBuffer = make(map[uint32][]byte)
@@ -70,6 +77,14 @@ func (ch *channel) recordReceive(seq uint32) bool {
 
 	if seq == 0 {
 		return false // sequence 0 is invalid
+	}
+
+	// Receive window: for ordered channels, drop packets too far ahead of the
+	// next-expected delivery slot. The sender will retransmit; meanwhile the
+	// reorder buffer stays bounded by maxReorderWindow.
+	if ch.mode == ReliableOrdered && ch.maxReorderWindow > 0 &&
+		seq >= ch.recvNextDeliver && seq-ch.recvNextDeliver >= ch.maxReorderWindow {
+		return false
 	}
 
 	if ch.recvAck == 0 {

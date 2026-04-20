@@ -17,13 +17,11 @@
 | 11 | Send Batching, Migration, Coalescing & Bandwidth | Done |
 | 12 | Performance Optimization | Done |
 | 13 | Performance Optimization Pass 2 | Done |
+| 14 | Security & Stability Hardening | Done |
+| 15 | Stateless Retry Cookie Handshake | Planned |
 
 ## Phase Completion Process
 
 Each phase produces a `phase-*.md` file with:
 1. What was built and design decisions made
 2. A checklist of test requirements — all must pass before moving to the next phase
-
-## All Phases Complete
-
-All 13 phases are done. See `progress/next.md` for future work ideas.

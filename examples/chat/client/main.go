@@ -58,7 +58,7 @@ func main() {
 			}
 			if line == "/quit" {
 				fmt.Println("Goodbye!")
-				cli.Close()
+				_ = cli.Close()
 				return
 			}
 			conn := cli.Connection()
@@ -67,13 +67,13 @@ func main() {
 			}
 			if err := conn.Send([]byte(line), 0); err != nil {
 				fmt.Printf("send error: %v\n", err)
-				cli.Close()
+				_ = cli.Close()
 				return
 			}
 			fmt.Print("> ")
 		}
 		// EOF (e.g. Ctrl-D).
-		cli.Close()
+		_ = cli.Close()
 	}()
 
 	<-handler.done

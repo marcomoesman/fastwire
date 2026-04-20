@@ -96,12 +96,14 @@ func TestNewReadPool(t *testing.T) {
 		t.Fatalf("read pool Get() len = %d, want %d", len(buf), size)
 	}
 
+	//nolint:staticcheck // SA6002: we intentionally store []byte in sync.Pool
 	pool.Put(buf)
 
 	buf2 := pool.Get().([]byte)
 	if len(buf2) != size {
 		t.Fatalf("read pool Get() after Put len = %d, want %d", len(buf2), size)
 	}
+	//nolint:staticcheck // SA6002: we intentionally store []byte in sync.Pool
 	pool.Put(buf2)
 }
 
@@ -131,6 +133,7 @@ func TestReadPoolConcurrency(t *testing.T) {
 			for range 100 {
 				buf := pool.Get().([]byte)
 				buf[0] = 1
+				//nolint:staticcheck // SA6002: we intentionally store []byte in sync.Pool
 				pool.Put(buf)
 			}
 		}()

@@ -74,6 +74,7 @@ func BatchOverhead(n int) int {
 }
 
 // flushBatch packs the connection's batch buffer into batched datagrams and sends them.
+// All pending buffers are returned to the pool on return, regardless of error.
 func (c *Connection) flushBatch(mtu int) error {
 	c.batchMu.Lock()
 	if len(c.batchBuf) == 0 {
@@ -85,6 +86,12 @@ func (c *Connection) flushBatch(mtu int) error {
 	copy(pending, c.batchBuf)
 	c.batchBuf = c.batchBuf[:0]
 	c.batchMu.Unlock()
+
+	defer func() {
+		for _, p := range pending {
+			putSendBuffer(p[:cap(p)])
+		}
+	}()
 
 	var dgBuf []byte
 	pktCount := 0
