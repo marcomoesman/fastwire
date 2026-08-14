@@ -82,15 +82,20 @@ func (c *Connection) flushBatch(mtu int) error {
 		return nil
 	}
 	// Swap out the pending packets under lock; process without lock.
-	pending := make([][]byte, len(c.batchBuf))
-	copy(pending, c.batchBuf)
-	c.batchBuf = c.batchBuf[:0]
+	pending := c.batchBuf
+	c.batchBuf = c.batchIdle[:0]
+	c.batchIdle = nil
 	c.batchMu.Unlock()
 
 	defer func() {
 		for _, p := range pending {
 			putSendBuffer(p[:cap(p)])
 		}
+		c.batchMu.Lock()
+		if cap(pending) > cap(c.batchIdle) {
+			c.batchIdle = pending[:0]
+		}
+		c.batchMu.Unlock()
 	}()
 
 	var dgBuf []byte

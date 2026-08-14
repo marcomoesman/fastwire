@@ -266,6 +266,9 @@ type Server struct {
 	// Write coalescing.
 	writeCh chan writeRequest
 
+	// Scratch slice reused by tick() to avoid per-tick allocation.
+	tickConns []*Connection
+
 	// Read buffer pool.
 	readPool *sync.Pool
 
@@ -407,6 +410,9 @@ func (s *Server) Stop() error {
 
 	s.wg.Wait()
 
+	s.drainIncoming()
+	s.drainWriteCh()
+
 	// Disconnect all remaining connections.
 	s.conns.forEach(func(conn *Connection) {
 		conn.releasePendingBuffers()
@@ -467,9 +473,11 @@ func (s *Server) readLoop() {
 			}
 			consecutiveErrors++
 			backoff := time.Duration(1<<min(consecutiveErrors, 7)) * time.Millisecond
+			timer := time.NewTimer(backoff)
 			select {
-			case <-time.After(backoff):
+			case <-timer.C:
 			case <-s.closeCh:
+				timer.Stop()
 				return
 			}
 			continue
@@ -497,6 +505,7 @@ func (s *Server) writeLoop() {
 		select {
 		case req := <-s.writeCh:
 			_, _ = s.conn.WriteToUDPAddrPort(req.data, req.addr)
+			putSendBuffer(req.data)
 			// Drain queued writes without blocking.
 			s.drainWriteCh()
 		case <-s.closeCh:
@@ -506,10 +515,28 @@ func (s *Server) writeLoop() {
 }
 
 func (s *Server) drainWriteCh() {
+	if s.writeCh == nil {
+		return
+	}
 	for {
 		select {
 		case req := <-s.writeCh:
 			_, _ = s.conn.WriteToUDPAddrPort(req.data, req.addr)
+			putSendBuffer(req.data)
+		default:
+			return
+		}
+	}
+}
+
+func (s *Server) drainIncoming() {
+	for {
+		select {
+		case pkt := <-s.incoming:
+			if pkt.buf != nil && s.readPool != nil {
+				//nolint:staticcheck // SA6002: we intentionally store []byte in sync.Pool
+				s.readPool.Put(pkt.buf)
+			}
 		default:
 			return
 		}
@@ -549,11 +576,11 @@ func (s *Server) tick() {
 doneIncoming:
 
 	// Collect connections to tick (avoid holding read lock during mutations).
-	var conns []*Connection
+	s.tickConns = s.tickConns[:0]
 	s.conns.forEach(func(conn *Connection) {
-		conns = append(conns, conn)
+		s.tickConns = append(s.tickConns, conn)
 	})
-	for _, conn := range conns {
+	for _, conn := range s.tickConns {
 		s.tickConnection(conn, now)
 	}
 
@@ -711,7 +738,7 @@ func (s *Server) setupSendFunc(conn *Connection, addr netip.AddrPort) {
 	if s.config.CoalesceIO && s.writeCh != nil {
 		conn.mu.Lock()
 		conn.sendFunc = func(data []byte) error {
-			cp := make([]byte, len(data))
+			cp := getSendBuffer(len(data))
 			copy(cp, data)
 			conn.bytesSent.Add(uint64(len(data)))
 			conn.sendBW.Record(uint64(len(data)))
@@ -719,6 +746,7 @@ func (s *Server) setupSendFunc(conn *Connection, addr netip.AddrPort) {
 			case s.writeCh <- writeRequest{data: cp, addr: conn.RemoteAddr()}:
 				return nil
 			case <-s.closeCh:
+				putSendBuffer(cp)
 				return ErrServerClosed
 			}
 		}

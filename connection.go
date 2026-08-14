@@ -87,9 +87,9 @@ const maxBatchQueueSize = 256
 // Connection represents a FastWire connection to a remote peer.
 type Connection struct {
 	mu sync.Mutex
-	// state and remoteAddr are protected by mu. External code must read
-	// remoteAddr via RemoteAddr() — it changes during migration under mu.
-	state      ConnState
+	// state is an atomic ConnState. remoteAddr is protected by mu; external
+	// code must read it via RemoteAddr() — it changes during migration under mu.
+	state      atomic.Uint32
 	remoteAddr netip.AddrPort
 
 	sendCipher *fwcrypto.CipherState
@@ -131,8 +131,9 @@ type Connection struct {
 
 	// Send batching state.
 	batchEnabled bool
-	batchMu      sync.Mutex // protects batchBuf
+	batchMu      sync.Mutex // protects batchBuf / batchIdle
 	batchBuf     [][]byte
+	batchIdle    [][]byte    // recycled empty batchBuf after flush
 	skipBatch    atomic.Bool // true during SendImmediate
 }
 
@@ -171,7 +172,6 @@ func newConnection(in connectionInput) *Connection {
 	now := time.Now()
 	cp, _ := newCompressorPool(in.compression)
 	conn := &Connection{
-		state:      StateConnected,
 		remoteAddr: in.addr,
 		sendCipher: in.sendCipher,
 		recvCipher: in.recvCipher,
@@ -194,24 +194,40 @@ func newConnection(in connectionInput) *Connection {
 		migrationToken: in.token,
 		batchEnabled:   in.features&byte(FeatureSendBatching) != 0,
 	}
+	conn.state.Store(uint32(StateConnected))
 	conn.lastSendNano.Store(now.UnixNano())
 	conn.lastRecvNano.Store(now.UnixNano())
 	return conn
 }
 
-// Send queues data for delivery on the given channel during the next tick.
+// Send queues a copy of data for delivery on the given channel during the next tick.
+// The caller may reuse or mutate data immediately after Send returns.
 func (c *Connection) Send(data []byte, channel byte) error {
+	return c.enqueueSend(data, channel, true)
+}
+
+// SendOwned queues data for delivery without copying. The caller must not
+// mutate data until the next tick has drained the send queue (or SendOwned
+// returns an error). Prefer Send when the buffer is reused.
+func (c *Connection) SendOwned(data []byte, channel byte) error {
+	return c.enqueueSend(data, channel, false)
+}
+
+func (c *Connection) enqueueSend(data []byte, channel byte, copyData bool) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.state != StateConnected {
+	if ConnState(c.state.Load()) != StateConnected {
 		return ErrConnectionClosed
 	}
 	if int(channel) >= len(c.channels) {
 		return ErrInvalidChannel
 	}
-	cp := make([]byte, len(data))
-	copy(cp, data)
-	c.sendQueue = append(c.sendQueue, outgoingMessage{data: cp, channel: channel})
+	if copyData {
+		cp := make([]byte, len(data))
+		copy(cp, data)
+		data = cp
+	}
+	c.sendQueue = append(c.sendQueue, outgoingMessage{data: data, channel: channel})
 	return nil
 }
 
@@ -219,7 +235,7 @@ func (c *Connection) Send(data []byte, channel byte) error {
 // It goes through compress -> fragment -> encrypt -> send.
 func (c *Connection) SendImmediate(data []byte, channel byte) error {
 	c.mu.Lock()
-	if c.state != StateConnected {
+	if ConnState(c.state.Load()) != StateConnected {
 		c.mu.Unlock()
 		return ErrConnectionClosed
 	}
@@ -262,12 +278,10 @@ func (c *Connection) Stats() ConnectionStats {
 // Close initiates a graceful disconnect with retry.
 // The disconnect packet is retried by the tick loop; Close returns immediately.
 func (c *Connection) Close() error {
-	c.mu.Lock()
-	if c.state != StateConnected {
-		c.mu.Unlock()
+	if !c.state.CompareAndSwap(uint32(StateConnected), uint32(StateDisconnecting)) {
 		return ErrConnectionClosed
 	}
-	c.state = StateDisconnecting
+	c.mu.Lock()
 	sf := c.sendFunc
 	c.mu.Unlock()
 
@@ -290,12 +304,13 @@ func (c *Connection) Close() error {
 					// Wrap in batch frame if needed.
 					pktData := encrypted
 					if c.batchEnabled {
-						frame := make([]byte, BatchHeaderSize+BatchLenSize+len(encrypted))
+						frame := getSendBuffer(BatchHeaderSize + BatchLenSize + len(encrypted))
+						n := BatchHeaderSize + BatchLenSize + len(encrypted)
 						frame[0] = 1
 						frame[1] = byte(len(encrypted))
 						frame[2] = byte(len(encrypted) >> 8)
 						copy(frame[3:], encrypted)
-						pktData = frame
+						pktData = frame[:n]
 					}
 					c.mu.Lock()
 					c.disconnectPacket = pktData
@@ -332,9 +347,7 @@ func (c *Connection) InFlightCount() int {
 
 // State returns the current connection state.
 func (c *Connection) State() ConnState {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.state
+	return ConnState(c.state.Load())
 }
 
 // RemoteAddr returns the remote address of the connection.
@@ -345,9 +358,7 @@ func (c *Connection) RemoteAddr() netip.AddrPort {
 }
 
 func (c *Connection) setState(s ConnState) {
-	c.mu.Lock()
-	c.state = s
-	c.mu.Unlock()
+	c.state.Store(uint32(s))
 }
 
 func (c *Connection) touchSend() {
@@ -360,10 +371,7 @@ func (c *Connection) touchRecv() {
 
 // needsHeartbeat reports whether no packet has been sent within the interval.
 func (c *Connection) needsHeartbeat(interval time.Duration) bool {
-	c.mu.Lock()
-	state := c.state
-	c.mu.Unlock()
-	return state == StateConnected &&
+	return ConnState(c.state.Load()) == StateConnected &&
 		time.Duration(time.Now().UnixNano()-c.lastSendNano.Load()) >= interval
 }
 
@@ -374,10 +382,7 @@ func (c *Connection) isTimedOut(timeout time.Duration) bool {
 
 // needsHeartbeatAt is like needsHeartbeat but uses the provided time instead of time.Now().
 func (c *Connection) needsHeartbeatAt(now time.Time, interval time.Duration) bool {
-	c.mu.Lock()
-	state := c.state
-	c.mu.Unlock()
-	return state == StateConnected &&
+	return ConnState(c.state.Load()) == StateConnected &&
 		time.Duration(now.UnixNano()-c.lastSendNano.Load()) >= interval
 }
 
@@ -398,6 +403,18 @@ func (c *Connection) releasePendingBuffers() {
 		ch.releasePendingBuffers()
 	}
 	c.reassembly.reset()
+	c.mu.Lock()
+	pkt := c.disconnectPacket
+	c.disconnectPacket = nil
+	c.mu.Unlock()
+	putSendBuffer(pkt)
+	c.batchMu.Lock()
+	for _, p := range c.batchBuf {
+		putSendBuffer(p)
+	}
+	c.batchBuf = nil
+	c.batchIdle = nil
+	c.batchMu.Unlock()
 }
 
 // drainSendQueue returns and clears the current send queue.
@@ -424,12 +441,15 @@ func (c *Connection) requeue(msgs []outgoingMessage) {
 // (retransmits, heartbeats, disconnect, SendImmediate).
 func (c *Connection) sendFramed(encrypted []byte) error {
 	if c.batchEnabled {
-		frame := make([]byte, BatchHeaderSize+BatchLenSize+len(encrypted))
+		n := BatchHeaderSize + BatchLenSize + len(encrypted)
+		frame := getSendBuffer(n)
 		frame[0] = 1 // count = 1
 		frame[1] = byte(len(encrypted))
 		frame[2] = byte(len(encrypted) >> 8)
 		copy(frame[3:], encrypted)
-		return c.sendFunc(frame)
+		err := c.sendFunc(frame[:n])
+		putSendBuffer(frame)
+		return err
 	}
 	return c.sendFunc(encrypted)
 }

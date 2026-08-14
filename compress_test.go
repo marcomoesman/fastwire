@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"net/netip"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -76,6 +77,25 @@ func TestLZ4Empty(t *testing.T) {
 	}
 	if len(compressed) != 0 {
 		t.Fatalf("expected empty compressed, got %d bytes", len(compressed))
+	}
+}
+
+func TestLZ4CompressReuse(t *testing.T) {
+	c := newLZ4Compressor()
+	large := []byte(strings.Repeat("abcdefghijklmnopqrstuvwxyz", 200))
+	small := []byte(strings.Repeat("hello world ", 20))
+	for _, src := range [][]byte{large, small, large} {
+		compressed, err := c.Compress(nil, src)
+		if err != nil {
+			t.Fatalf("Compress: %v", err)
+		}
+		decompressed, err := c.Decompress(nil, compressed)
+		if err != nil {
+			t.Fatalf("Decompress: %v", err)
+		}
+		if !bytes.Equal(decompressed, src) {
+			t.Fatal("round-trip mismatch after reuse")
+		}
 	}
 }
 
@@ -626,6 +646,58 @@ func TestHandshakeDictHashMismatch(t *testing.T) {
 	}
 	if pending.compression != compressionDictMismatch {
 		t.Fatalf("expected compressionDictMismatch, got %d", pending.compression)
+	}
+}
+
+func TestCompressPayloadRecyclesScratch(t *testing.T) {
+	payload := []byte(strings.Repeat("benchmark compressible data pattern ", 28))
+	for _, algo := range []CompressionAlgorithm{CompressionLZ4, CompressionZstd} {
+		t.Run(algoName(algo), func(t *testing.T) {
+			pool, err := newCompressorPool(CompressionConfig{Algorithm: algo, Hurdle: 0})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			first, flags, err := pool.compressPayload(payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if flags == 0 {
+				t.Fatal("expected compression")
+			}
+			if cap(first) == DefaultMTU {
+				t.Fatalf("result cap = %d, still aliases send-pool scratch", cap(first))
+			}
+			saved := bytes.Clone(first)
+
+			_, _, err = pool.compressPayload(payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(first, saved) {
+				t.Fatal("result overwritten after scratch was recycled")
+			}
+
+			var before, after runtime.MemStats
+			runtime.ReadMemStats(&before)
+			const n = 200
+			for range n {
+				out, flags, err := pool.compressPayload(payload)
+				if err != nil || flags == 0 {
+					t.Fatal("compress")
+				}
+				if cap(out) == DefaultMTU {
+					t.Fatal("result aliases send-pool scratch")
+				}
+			}
+			runtime.ReadMemStats(&after)
+			bytesPerOp := (after.TotalAlloc - before.TotalAlloc) / n
+			// Copy-out of a ~60-byte frame. A leaked 1200-byte pool buffer
+			// would land near DefaultMTU per op.
+			if bytesPerOp >= uint64(DefaultMTU) {
+				t.Fatalf("bytes/op = %d, scratch is leaking", bytesPerOp)
+			}
+		})
 	}
 }
 

@@ -9,6 +9,8 @@ type Handler interface {
 	// OnDisconnect is called when a connection is closed, with the reason for closure.
 	OnDisconnect(conn *Connection, reason DisconnectReason)
 	// OnMessage is called when a complete message is received on the given channel.
+	// data aliases an internal buffer and is invalid after OnMessage returns.
+	// Handlers that need to retain the bytes must copy them.
 	OnMessage(conn *Connection, data []byte, channel byte)
 	// OnError is called when a non-fatal error occurs on a connection.
 	OnError(conn *Connection, err error)

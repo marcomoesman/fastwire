@@ -33,3 +33,5 @@ go.work.sum
 
 # OS junk
 .DS_Store
+.prompto/db.sqlite
+.prompto/permissions.json

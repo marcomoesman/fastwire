@@ -1,6 +1,7 @@
 package fastwire
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
@@ -19,19 +20,13 @@ type Compressor interface {
 
 // --- LZ4 implementation ---
 
-type lz4Compressor struct {
-	htPool sync.Pool // pool of []int hash tables
-}
+// lz4Compressor is stateless. pierrec/lz4 v4 ignores the hash-table argument
+// on CompressBlock and uses its own pooled Compressor, so we do not allocate
+// or zero a 64Ki-entry table per call.
+type lz4Compressor struct{}
 
 func newLZ4Compressor() *lz4Compressor {
-	return &lz4Compressor{
-		htPool: sync.Pool{
-			New: func() any {
-				ht := make([]int, 1<<16)
-				return &ht
-			},
-		},
-	}
+	return &lz4Compressor{}
 }
 
 func (c *lz4Compressor) Algorithm() CompressionAlgorithm {
@@ -45,15 +40,6 @@ func (c *lz4Compressor) Algorithm() CompressionAlgorithm {
 func (c *lz4Compressor) Compress(dst, src []byte) ([]byte, error) {
 	if len(src) == 0 {
 		return dst, nil
-	}
-
-	htp := c.htPool.Get().(*[]int)
-	defer c.htPool.Put(htp)
-	ht := *htp
-
-	// Clear the hash table.
-	for i := range ht {
-		ht[i] = 0
 	}
 
 	// Reserve space: 4 bytes for original size + worst-case LZ4 output.
@@ -71,8 +57,7 @@ func (c *lz4Compressor) Compress(dst, src []byte) ([]byte, error) {
 	// Write original size as uint32 LE.
 	binary.LittleEndian.PutUint32(dst[offset:], uint32(len(src)))
 
-	// Compress.
-	n, err := lz4.CompressBlock(src, dst[offset+4:], ht)
+	n, err := lz4.CompressBlock(src, dst[offset+4:], nil)
 	if err != nil {
 		return nil, fmt.Errorf("%w: lz4: %v", ErrCompressionFailed, err)
 	}
@@ -258,13 +243,18 @@ func newCompressorPool(config CompressionConfig) (*compressorPool, error) {
 
 // compressPayload compresses the payload if conditions are met.
 // Returns the (possibly compressed) payload and the fragment flags to set.
+// The scratch buffer used for compression is always returned to the pool
+// before this function returns; the caller owns any compressed result.
 func (p *compressorPool) compressPayload(payload []byte) ([]byte, FragmentFlag, error) {
 	if p.compressor == nil || uint32(len(payload)) < p.config.Hurdle {
 		return payload, 0, nil
 	}
 
-	compressed, err := p.compressor.Compress(nil, payload)
+	bound := 4 + lz4.CompressBlockBound(len(payload))
+	dst := getSendBuffer(bound)
+	compressed, err := p.compressor.Compress(dst[:0], payload)
 	if err != nil {
+		putSendBuffer(dst)
 		// Incompressible data — return original uncompressed.
 		if err == ErrCompressionFailed {
 			return payload, 0, nil
@@ -274,14 +264,27 @@ func (p *compressorPool) compressPayload(payload []byte) ([]byte, FragmentFlag, 
 
 	// Expansion check: if compressed >= original, skip.
 	if len(compressed) >= len(payload) {
+		putSendBuffer(dst)
 		return payload, 0, nil
 	}
+
+	// EncodeAll/LZ4 write into dst. Copy the result out so dst can go
+	// back to the pool even if the caller discards the return (benchmarks).
+	if sameBacking(compressed, dst) {
+		compressed = bytes.Clone(compressed)
+	}
+	putSendBuffer(dst)
 
 	flags := FragFlagCompressed
 	if p.compressor.Algorithm() == CompressionZstd {
 		flags |= FragFlagZstd
 	}
 	return compressed, flags, nil
+}
+
+// sameBacking reports whether a and b share the same backing array.
+func sameBacking(a, b []byte) bool {
+	return cap(a) > 0 && cap(a) == cap(b) && &a[:1][0] == &b[:1][0]
 }
 
 // decompressPayload decompresses the payload based on fragment flags.
@@ -310,11 +313,12 @@ func (p *compressorPool) decompressPayload(payload []byte, flags FragmentFlag) (
 		return dec.Decompress(nil, payload)
 	}
 
-	// LZ4 decompression.
-	lz := newLZ4Compressor()
+	// LZ4 decompression. The compressor is stateless, so a zero value is fine
+	// when this connection did not negotiate LZ4.
+	var lz lz4Compressor
 	if p.compressor != nil {
 		if lc, ok := p.compressor.(*lz4Compressor); ok {
-			lz = lc
+			lz = *lc
 		}
 	}
 	return lz.Decompress(nil, payload)

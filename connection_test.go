@@ -191,6 +191,40 @@ func TestSendOnInvalidChannel(t *testing.T) {
 	}
 }
 
+func TestSendCopiesBuffer(t *testing.T) {
+	addr := netip.MustParseAddrPort("127.0.0.1:9000")
+	send, _ := fwcrypto.NewCipherState(nil, CipherNone)
+	recv, _ := fwcrypto.NewCipherState(nil, CipherNone)
+	conn := newConnection(connectionInput{addr: addr, sendCipher: send, recvCipher: recv, suite: CipherNone, layout: DefaultChannelLayout(), congestionMode: CongestionConservative})
+
+	buf := []byte("hello")
+	if err := conn.Send(buf, 0); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	buf[0] = 'x'
+	q := conn.drainSendQueue()
+	if len(q) != 1 || string(q[0].data) != "hello" {
+		t.Fatalf("Send did not copy: got %q", q)
+	}
+}
+
+func TestSendOwnedTakesCallerBuffer(t *testing.T) {
+	addr := netip.MustParseAddrPort("127.0.0.1:9000")
+	send, _ := fwcrypto.NewCipherState(nil, CipherNone)
+	recv, _ := fwcrypto.NewCipherState(nil, CipherNone)
+	conn := newConnection(connectionInput{addr: addr, sendCipher: send, recvCipher: recv, suite: CipherNone, layout: DefaultChannelLayout(), congestionMode: CongestionConservative})
+
+	buf := []byte("hello")
+	if err := conn.SendOwned(buf, 0); err != nil {
+		t.Fatalf("SendOwned: %v", err)
+	}
+	buf[0] = 'x'
+	q := conn.drainSendQueue()
+	if len(q) != 1 || string(q[0].data) != "xello" {
+		t.Fatalf("SendOwned should alias caller buffer: got %q", q)
+	}
+}
+
 func TestCloseDuringSend(t *testing.T) {
 	addr := netip.MustParseAddrPort("127.0.0.1:9000")
 	send, _ := fwcrypto.NewCipherState(nil, CipherNone)

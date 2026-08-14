@@ -27,6 +27,7 @@ type channel struct {
 	maxReorderWindow uint32 // ReliableOrdered only; 0 means unbounded
 
 	sendSeq atomic.Uint32 // next sequence to assign (starts at 0, first call returns 1)
+	pending atomic.Int32  // unacked reliable packets; lock-free for CanSend
 
 	// Protected by mu.
 	mu              sync.Mutex
@@ -158,6 +159,7 @@ func (ch *channel) processAcks(ack, ackField uint32, r *rtt.State) []uint32 {
 	for _, p := range ch.pendingSend {
 		if isAcked(p.sequence, ack, ackField) {
 			acked = append(acked, p.sequence)
+			ch.pending.Add(-1)
 			// Measure RTT only for first-transmit packets (Karn's algorithm).
 			if p.firstTransmit && r != nil {
 				r.AddSample(now.Sub(p.sendTime))
@@ -277,15 +279,14 @@ func (ch *channel) clearNeedsAck() bool {
 // addPending appends a packet to the retransmission queue.
 func (ch *channel) addPending(p pendingPacket) {
 	ch.mu.Lock()
-	defer ch.mu.Unlock()
 	ch.pendingSend = append(ch.pendingSend, p)
+	ch.pending.Add(1)
+	ch.mu.Unlock()
 }
 
 // pendingCount returns the number of unacked packets in the retransmission queue.
 func (ch *channel) pendingCount() int {
-	ch.mu.Lock()
-	defer ch.mu.Unlock()
-	return len(ch.pendingSend)
+	return int(ch.pending.Load())
 }
 
 // releasePendingBuffers returns all pooled buffers held by pending packets.
@@ -300,6 +301,7 @@ func (ch *channel) releasePendingBuffers() {
 	}
 	ch.pendingSend = nil
 	ch.recvBuffer = nil
+	ch.pending.Store(0)
 }
 
 // checkRetransmissions returns packets that need retransmission and a kill flag

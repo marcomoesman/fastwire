@@ -154,17 +154,20 @@ func (c *Client) Connect(addr string) error {
 	go c.readLoop()
 
 	// Wait for handshake or timeout.
+	timer := time.NewTimer(c.config.ConnectTimeout)
 	select {
 	case <-c.connectDone:
+		timer.Stop()
 		if c.connectErr != nil {
 			c.closeOnce.Do(func() {
 				close(c.closeCh)
 				_ = c.conn.Close()
 			})
 			c.wg.Wait()
+			c.drainIncoming()
 			return c.connectErr
 		}
-	case <-time.After(c.config.ConnectTimeout):
+	case <-timer.C:
 		c.mu.Lock()
 		c.connectAborted = true
 		c.mu.Unlock()
@@ -173,6 +176,7 @@ func (c *Client) Connect(addr string) error {
 			_ = c.conn.Close()
 		})
 		c.wg.Wait()
+		c.drainIncoming()
 		return ErrHandshakeTimeout
 	}
 
@@ -205,18 +209,18 @@ func (c *Client) Connect(addr string) error {
 // migration token prefix if needed.
 func (c *Client) setupSendFunc(conn *Connection) {
 	conn.sendFunc = func(data []byte) error {
-		var buf []byte
+		out := data
 		if conn.features&byte(FeatureConnectionMigration) != 0 {
-			buf = make([]byte, MigrationTokenSize+len(data))
+			buf := getSendBuffer(MigrationTokenSize + len(data))
 			copy(buf, conn.migrationToken[:])
 			copy(buf[MigrationTokenSize:], data)
-		} else {
-			buf = data
+			out = buf[:MigrationTokenSize+len(data)]
+			defer putSendBuffer(buf)
 		}
-		_, err := c.conn.Write(buf)
+		_, err := c.conn.Write(out)
 		if err == nil {
-			conn.bytesSent.Add(uint64(len(buf)))
-			conn.sendBW.Record(uint64(len(buf)))
+			conn.bytesSent.Add(uint64(len(out)))
+			conn.sendBW.Record(uint64(len(out)))
 		}
 		return err
 	}
@@ -250,6 +254,7 @@ func (c *Client) Close() error {
 		}
 	})
 	c.wg.Wait()
+	c.drainIncoming()
 	return nil
 }
 
@@ -287,9 +292,11 @@ func (c *Client) readLoop() {
 			}
 			consecutiveErrors++
 			backoff := time.Duration(1<<min(consecutiveErrors, 7)) * time.Millisecond
+			timer := time.NewTimer(backoff)
 			select {
-			case <-time.After(backoff):
+			case <-timer.C:
 			case <-c.closeCh:
+				timer.Stop()
 				return
 			}
 			continue
@@ -404,6 +411,23 @@ func (c *Client) tickLoop() {
 		case <-ticker.C:
 			c.tick()
 		case <-c.closeCh:
+			return
+		}
+	}
+}
+
+func (c *Client) drainIncoming() {
+	if c.incoming == nil || c.readPool == nil {
+		return
+	}
+	for {
+		select {
+		case pkt := <-c.incoming:
+			if pkt.buf != nil {
+				//nolint:staticcheck // SA6002: we intentionally store []byte in sync.Pool
+				c.readPool.Put(pkt.buf)
+			}
+		default:
 			return
 		}
 	}

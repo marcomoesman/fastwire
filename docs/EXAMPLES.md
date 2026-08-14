@@ -28,7 +28,8 @@ func (h *EchoHandler) OnDisconnect(conn *fastwire.Connection, reason fastwire.Di
 
 func (h *EchoHandler) OnMessage(conn *fastwire.Connection, data []byte, channel byte) {
     fmt.Printf("received from %s: %s\n", conn.RemoteAddr(), data)
-    // Echo back on the same channel.
+    // Echo back on the same channel. Send copies, so it is safe even though
+    // data is invalid after this callback returns.
     conn.Send(data, channel)
 }
 

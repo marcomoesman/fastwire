@@ -30,8 +30,9 @@ func (lt *LossTracker) RecordSend(seq uint32) {
 	lt.mu.Lock()
 	defer lt.mu.Unlock()
 
+	c := lt.count.Load()
 	// If overwriting an existing entry, clean up.
-	if lt.count.Load() == lossWindowSize {
+	if c == lossWindowSize {
 		old := lt.entries[lt.head]
 		if old.acked {
 			lt.ackCount.Add(-1)
@@ -40,7 +41,7 @@ func (lt *LossTracker) RecordSend(seq uint32) {
 
 	lt.entries[lt.head] = lossEntry{seq: seq, acked: false}
 	lt.head = (lt.head + 1) % lossWindowSize
-	if lt.count.Load() < lossWindowSize {
+	if c < lossWindowSize {
 		lt.count.Add(1)
 	}
 }
@@ -65,10 +66,8 @@ func (lt *LossTracker) RecordAck(seq uint32) {
 
 // Loss returns the current packet loss ratio (0.0-1.0).
 func (lt *LossTracker) Loss() float64 {
-	lt.mu.Lock()
 	c := lt.count.Load()
 	a := lt.ackCount.Load()
-	lt.mu.Unlock()
 	if c == 0 {
 		return 0.0
 	}

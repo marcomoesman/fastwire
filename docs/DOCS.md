@@ -536,10 +536,13 @@ The `Connection` type represents an established connection to a remote peer. Obt
 ### Sending Messages
 
 ```go
-// Queue for next tick (batched).
+// Queue for next tick. Send copies data; the caller may reuse the buffer.
 conn.Send([]byte("hello"), 0)
 
-// Send immediately, bypassing tick queue.
+// Queue without copying. Do not mutate data until the next tick drains the queue.
+conn.SendOwned(payload, 0)
+
+// Send immediately, bypassing the tick queue.
 conn.SendImmediate([]byte("urgent"), 0)
 ```
 
@@ -549,7 +552,8 @@ The second argument is the channel ID. Channel 0 is `ReliableOrdered` in the def
 
 | Method | Description |
 |--------|-------------|
-| `Send(data, channel)` | Queue message for next tick |
+| `Send(data, channel)` | Queue a copy of the message for next tick |
+| `SendOwned(data, channel)` | Queue without copying; caller must not mutate `data` until the next tick |
 | `SendImmediate(data, channel)` | Send immediately (bypass queue) |
 | `Close()` | Initiate graceful disconnect (non-blocking, retries via tick loop) |
 | `State()` | Current `ConnState` |
@@ -616,6 +620,15 @@ type MyHandler struct {
 
 func (h *MyHandler) OnMessage(conn *fastwire.Connection, data []byte, channel byte) {
     fmt.Printf("received: %s\n", data)
+}
+```
+
+`data` aliases an internal receive buffer and is **invalid after `OnMessage` returns**. Copy the bytes if you need to retain them:
+
+```go
+func (h *MyHandler) OnMessage(conn *fastwire.Connection, data []byte, channel byte) {
+    owned := bytes.Clone(data)
+    // ... keep owned beyond this call
 }
 ```
 
@@ -834,7 +847,7 @@ If connections time out frequently, check that:
 
 ### Thread Safety Guarantees
 
-- `Connection.Send()` and `Connection.SendImmediate()` are safe to call from any goroutine.
+- `Connection.Send()`, `Connection.SendOwned()`, and `Connection.SendImmediate()` are safe to call from any goroutine.
 - `Connection.Close()` is safe to call concurrently with `Send()`.
 - `Handler` callbacks fire on the tick goroutine (`TickAuto`) or the caller's goroutine (`TickDriven`). Handlers should avoid blocking.
 - All compression, encryption, and fragmentation operations are internally synchronized.

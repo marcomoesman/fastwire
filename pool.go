@@ -32,10 +32,11 @@ func getSendBuffer(size int) []byte {
 	return make([]byte, size)
 }
 
-// putSendBuffer returns a send buffer to the pool. Only buffers with
-// cap >= DefaultMTU (i.e. those originally obtained from the pool) are recycled.
+// putSendBuffer returns a send buffer to the pool. Only DefaultMTU-capacity
+// buffers (those obtained from the pool) are recycled — oversized heap
+// allocations are left for GC so they cannot pollute the pool.
 func putSendBuffer(buf []byte) {
-	if cap(buf) >= DefaultMTU {
+	if cap(buf) == DefaultMTU {
 		//nolint:staticcheck // SA6002: we intentionally store []byte in sync.Pool
 		bufferPool.Put(buf[:cap(buf)])
 	}
@@ -54,7 +55,7 @@ func getDecryptBuffer() []byte {
 }
 
 func putDecryptBuffer(buf []byte) {
-	if cap(buf) >= DefaultMTU {
+	if cap(buf) == DefaultMTU {
 		//nolint:staticcheck // SA6002: we intentionally store []byte in sync.Pool
 		decryptPool.Put(buf[:cap(buf)])
 	}
